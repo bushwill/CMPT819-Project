@@ -1,0 +1,5 @@
+numpy>=2.2.2
+scikit-image
+pandas
+pytest
+matplotlib>=3.7.1
