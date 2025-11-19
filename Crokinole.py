@@ -379,293 +379,273 @@ def visualize_scoring_regions(img, scoring_mask):
         count = np.sum(scoring_mask == score)
         percentage = (count / scoring_mask.size) * 100
         print(f"  {score}pt region: {count} pixels ({percentage:.1f}%)")
-def _wood_mask(image, min_L=0.15, min_chroma=12.0):
+
+# -----------------------------
+# STEP 5: Disc detection + colour grouping
+# -----------------------------
+
+def _expected_disc_radius(board_result, pad_frac=0.10, min_px=4):
     """
-    Return boolean mask of 'wood-like' pixels:
-    - Not very dark (L > min_L, L in [0,1])
-    - With some chroma (sqrt(a^2 + b^2) > min_chroma)
-    Tuned to keep the brown board and exclude the black ditch.
+    Use the 20-hole radius as the expected disc radius.
+    'pad_frac' widens the allowed band by ±(pad_frac * r0).
     """
-    img = image.astype(float) / 255.0
-    lab = color.rgb2lab(img)  # L ~ [0,100]
-    L = lab[..., 0] / 100.0
-    a = lab[..., 1]
-    b = lab[..., 2]
-    chroma = np.sqrt(a * a + b * b)
-    mask = (L > min_L) & (chroma > min_chroma)
-    # Clean up: remove small specks and fill small holes
-    mask = morphology.remove_small_objects(mask, 500)
-    mask = morphology.remove_small_holes(mask, 500)
-    return mask
+    rings = board_result['rings']
+    r0 = float(rings.get('center', 0.0))   # 20-hole radius
+    if r0 <= 0:
+        return None, None, None
+    band = max(min_px, r0 * pad_frac)
+    return r0, max(2, int(r0 - band)), int(r0 + band)
 
 
-def _playable_mask_robust(image, board_result, inset_px=2):
-    circle = _play_area_mask(image.shape, board_result, inset_px=inset_px)
-    # wood mask is optional – use only if it keeps at least 20% of the circle
-    try:
-        wood = _wood_mask(image)
-        combo = circle & wood
-        frac_circle = float(np.mean(circle))
-        frac_combo  = float(np.mean(combo))
-        # if wood mask keeps too little of the circle, ignore it
-        if frac_circle > 0 and (frac_combo / frac_circle) >= 0.2:
-            return combo
-    except Exception:
-        pass
-    return circle
+def _play_area_mask(shape, board_result, inset_px=4):
+    """
+    Inside the playable wood (<= ring_5). If ring_5 is missing, use 0.95*outer.
+    """
+    h, w = shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, cy = board_result['center']
+    rings = board_result['rings']
+    rout = float(rings.get('outer', 0.0))
+    r5   = float(rings.get('ring_5', 0.95 * rout if rout > 0 else 0.0))
+
+    r_play_outer = r5 if r5 > 0 else rout
+    if rout > 0 and r5 > 0:
+        r_play_outer = min(r5, rout)
+
+    r_play_outer = max(0.0, r_play_outer - inset_px)
+    dist = np.hypot(xx - cx, yy - cy)
+    return dist <= r_play_outer
 
 
-def _perimeter_edge_score(edge_img, x, y, r, n=48):
-    h, w = edge_img.shape
+def _edge_ring(edg, x, y, r, n=48):
+    """Mean edge value along a circle."""
+    h, w = edg.shape
     ang = np.linspace(0, 2*np.pi, n, endpoint=False)
     xs = np.clip((x + r*np.cos(ang)).round().astype(int), 0, w-1)
     ys = np.clip((y + r*np.sin(ang)).round().astype(int), 0, h-1)
-    return float(edge_img[ys, xs].mean())
+    return float(edg[ys, xs].mean())
 
-def _interior_stats(lum, x, y, r):
+
+def _inside_stats(lum, x, y, r):
+    """Mean/std inside disc, and mean in thin outer ring."""
     h, w = lum.shape
     yy, xx = np.ogrid[:h, :w]
     d = np.hypot(xx - x, yy - y)
     inside = d <= (r - 1)
-    ann    = (d > (r + 1)) & (d <= (r + 4))
-    if not inside.any() or not ann.any():
+    ring   = (d > (r + 1)) & (d <= (r + 4))
+    if not inside.any() or not ring.any():
         return 0.0, 1.0, 0.0
     mu_in  = float(lum[inside].mean())
     sd_in  = float(lum[inside].std())
-    mu_out = float(lum[ann].mean())
+    mu_out = float(lum[ring].mean())
     return mu_in, sd_in, mu_out
 
-def _edge_contiguity(edge_img, x, y, r, n=72):
-    """Longest contiguous run of edge hits along the circle, / n."""
-    h, w = edge_img.shape
-    ang = np.linspace(0, 2*np.pi, n, endpoint=False)
-    xs = np.clip((x + r*np.cos(ang)).round().astype(int), 0, w-1)
-    ys = np.clip((y + r*np.sin(ang)).round().astype(int), 0, h-1)
-    hits = edge_img[ys, xs].astype(np.uint8)
 
-    # handle wrap-around by doubling then taking max run
-    arr = np.concatenate([hits, hits])
-    best = cur = 0
-    for v in arr:
-        if v:
-            cur += 1
-            best = max(best, cur)
-        else:
-            cur = 0
-    best = min(best, n)  # cap to one revolution
-    return best / float(n)
+def _lab_patch_mean(lab_img, x, y, half=3):
+    """Mean Lab colour in a small square patch around (x,y)."""
+    h, w = lab_img.shape[:2]
+    x0 = max(0, x - half); x1 = min(w, x + half + 1)
+    y0 = max(0, y - half); y1 = min(h, y + half + 1)
+    patch = lab_img[y0:y1, x0:x1, :]
+    return np.mean(patch.reshape(-1, 3), axis=0)
 
-def _ringline_pressure(edge_img, x, y, r, inner=0, outer=5):
+
+def _kmeans2_lab(feats, seed=0):
     """
-    Edge density in a thin outer annulus [r+inner, r+outer].
-    Ring lines produce high density; true discs have a clean ring.
-    Returns fraction in [0,1].
+    Tiny K=2 k-means on Lab features; returns labels (0/1) and centroids.
     """
-    h, w = edge_img.shape
-    yy, xx = np.ogrid[:h, :w]
-    d = np.hypot(xx - x, yy - y)
-    ann = (d >= (r + inner)) & (d <= (r + outer))
-    if not np.any(ann):
-        return 0.0
-    return float(edge_img[ann].mean())
+    if len(feats) == 0:
+        return np.array([], dtype=int), np.zeros((2, 3))
+    X = np.asarray(feats, float)
+    rng = np.random.default_rng(seed)
 
+    # k-means++ init
+    c0 = X[rng.integers(0, len(X))]
+    d2 = np.sum((X - c0) ** 2, axis=1)
+    probs = d2 / (d2.sum() + 1e-9)
+    c1 = X[rng.choice(len(X), p=probs)]
+    C = np.stack([c0, c1], axis=0)
+
+    for _ in range(20):
+        D = ((X[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
+        L = np.argmin(D, axis=1)
+        C_new = []
+        for k in (0, 1):
+            if np.any(L == k):
+                C_new.append(X[L == k].mean(axis=0))
+            else:
+                C_new.append(C[k])
+        C_new = np.stack(C_new, axis=0)
+        if np.allclose(C_new, C, atol=1e-4):
+            break
+        C = C_new
+
+    return L.astype(int), C
 
 
 def detect_discs(straightened_img, board_result, config):
     """
-    Robust disc detection:
-      - unsharp + CLAHE to boost edges
-      - adaptive Canny thresholds
-      - Hough circles on both normal and inverted edges
-      - LoG (blob_log) as a second detector
-      - NMS, playable-area mask, and limit to max_discs
-    Returns: list of {'center': (x,y), 'radius': r, 'score': a}
+    Disc detection tied to the 20-hole size + immediate colour grouping.
+
+    Returns a list of dicts:
+        {
+          'center': (x, y),
+          'radius': r,      # snapped to 20-hole radius
+          'score': edge_strength,
+          'team':  0 or 1,  # colour cluster
+          'lab':   (L, a, b)
+        }
     """
-    cfg = config['disc_detection']
     h, w = straightened_img.shape[:2]
-    min_dim = min(h, w)
-
-    # radius range (tighten a bit around the expected disc size)
-    r_min = int(max(2, cfg['min_radius_ratio'] * min_dim))
-    r_max = int(max(r_min + 2, cfg['max_radius_ratio'] * min_dim))
-
-    # Sharpen and equalize
-    img = straightened_img.astype(float) / 255.0
-    sharp = filters.unsharp_mask(img, radius=2, amount=1.5)
-    lum = color.rgb2gray(sharp)
-    lum = exposure.equalize_adapthist(lum, clip_limit=0.01)
-
-    # Adaptive Canny thresholds
-    med = np.median(lum)
-    low_t = max(0.05, med * 0.66)
-    high_t = min(0.98, med * 1.33)
-
-    edges = feature.canny(lum, sigma=1.5, low_threshold=low_t, high_threshold=high_t)
-    edges_inv = feature.canny(1.0 - lum, sigma=1.5, low_threshold=low_t, high_threshold=high_t)
-
-    # Hough on both polarities
-    def _hough_pass(edge_img, total_peaks, thr):
-        radii = np.arange(r_min, r_max + 1, 1)
-        hspaces = transform.hough_circle(edge_img, radii)
-        acc, cx, cy, rs = transform.hough_circle_peaks(hspaces, radii, total_num_peaks=total_peaks)
-        return [(int(x), int(y), int(r), float(a)) for a, x, y, r in zip(acc, cx, cy, rs) if float(a) >= thr]
-
-    strict = _hough_pass(edges, total_peaks=80, thr=cfg['strict_threshold'])
-    strict += _hough_pass(edges_inv, total_peaks=80, thr=cfg['strict_threshold'])
-
-    cands = strict
-    if len(cands) < 8:  # too few → fallback
-        loose = _hough_pass(edges, total_peaks=140, thr=cfg['fallback_threshold'])
-        loose += _hough_pass(edges_inv, total_peaks=140, thr=cfg['fallback_threshold'])
-        cands += loose
-
-    # LoG blobs (second detector), convert sigmas to radii ~ sqrt(2)*sigma
-    blobs = feature.blob_log(lum, min_sigma=r_min/np.sqrt(2), max_sigma=r_max/np.sqrt(2),
-                             num_sigma=10, threshold=0.02)
-    for y, x, sigma in blobs:
-        r = int(round(np.sqrt(2) * float(sigma)))
-        cands.append((int(x), int(y), r, 0.5))  # give a modest score
-
-    # Non-max suppression by center spacing (conservative to kill duplicates)
-    cands = sorted(cands, key=lambda d: d[3], reverse=True)
-    print("[DD] initial candidates:", len(cands))
-    keep = []
-    for x, y, r, s in cands:
-        ok = True
-        for x2, y2, r2, s2 in keep:
-            # slightly tighter than before to reduce dupes
-            if np.hypot(x - x2, y - y2) < 1.0 * max(r, r2):
-                ok = False
-                break
-        if ok:
-            keep.append((x, y, r, s))
-    if not keep:
-        return []
-    print("[DD] after NMS:", len(keep))
-
-
-    # ---------- Adaptive radius band around dominant size ----------
-    radii = np.array([r for _, _, r, _ in keep], dtype=float)
-    r_med = float(np.median(radii))
-    iqr   = float(np.percentile(radii, 75) - np.percentile(radii, 25))
-    if iqr <= 0:
-        iqr = max(1.0, 0.1 * r_med)
-
-    # primary band (±0.9*IQR) but also clamp to ±25% of the median
-    r_lo_h = r_med - 0.9 * iqr
-    r_hi_h = r_med + 0.9 * iqr
-    r_lo_p = 0.80 * r_med
-    r_hi_p = 1.25 * r_med
-    r_lo = max(r_min, min(r_lo_h, r_lo_p))
-    r_hi = min(r_max, max(r_hi_h, r_hi_p))
-
-    keep = [(x, y, r, s) for (x, y, r, s) in keep if (r_lo <= r <= r_hi)]
-    if not keep:
-        # last resort: just use the ±25% band
-        r_lo, r_hi = max(r_min, r_lo_p), min(r_max, r_hi_p)
-        keep = [(x, y, r, s) for (x, y, r, s) in cands if (r_lo <= r <= r_hi)]
-    if not keep:
+    r0, r_min, r_max = _expected_disc_radius(board_result, pad_frac=0.10)  # ±10%
+    if r0 is None:
+        print("[DD] No center ring radius; cannot infer disc size.")
         return []
 
+    cfg = config.get('disc_detection', {})
+    max_discs = cfg.get('max_discs', 28)
 
+    # --- Pre-processing -------------------------------------------------------
+    img_f = straightened_img.astype(float) / 255.0
+    sharp = filters.unsharp_mask(img_f, radius=2, amount=1.5)
+    lum   = color.rgb2gray(sharp)
+    lum   = exposure.equalize_adapthist(lum, clip_limit=0.01)
 
-    # ---------- Build robust playable mask ----------
-    edges_strong = np.maximum(edges, edges_inv)
-    mask_play = _playable_mask_robust(straightened_img, board_result,
-                                      inset_px=max(3, int(0.003 * min_dim)))
-    print("[DD] playable mask true frac:",
-      float(np.mean(_playable_mask_robust(straightened_img, board_result,
-                                          inset_px=max(3, int(0.003*min_dim))))))
+    med = float(np.median(lum))
+    low_t, high_t = max(0.05, 0.66 * med), min(0.98, 1.33 * med)
 
+    e1 = feature.canny(lum,        sigma=1.5,
+                       low_threshold=low_t, high_threshold=high_t)
+    e2 = feature.canny(1.0 - lum,  sigma=1.5,
+                       low_threshold=low_t, high_threshold=high_t)
+    edges = np.maximum(e1, e2)
 
-    # ---------- Compute features for adaptive thresholds ----------
-    feats = []
-    for x, y, r, s in keep:
-        if not (0 <= x < w and 0 <= y < h and mask_play[y, x]):
+    # --- Restrict to playable wood -------------------------------------------
+    play_mask = _play_area_mask(straightened_img.shape,
+                                board_result,
+                                inset_px=max(3, int(0.003 * min(h, w))))
+
+    # --- Hough circles in tight radius band ----------------------------------
+    radii = np.arange(max(2, r_min), max(3, r_max + 1), 1, dtype=int)
+    hspaces = transform.hough_circle(edges, radii)
+    acc, cx, cy, rs = transform.hough_circle_peaks(
+        hspaces, radii, total_num_peaks=140
+    )
+
+    cands = []
+    for a, x, y, r in zip(acc, cx, cy, rs):
+        x = int(x); y = int(y); r = int(r)
+        if not (0 <= x < w and 0 <= y < h and play_mask[y, x]):
             continue
-        e_score = _perimeter_edge_score(edges_strong, x, y, r, n=50)
-        mu_in, sd_in, mu_out = _interior_stats(lum, x, y, r)
+
+        e_hit = _edge_ring(edges, x, y, r, n=50)
+        mu_in, sd_in, mu_out = _inside_stats(lum, x, y, r)
         contrast = abs(mu_in - mu_out)
-        feats.append((x, y, r, s, e_score, sd_in, contrast))
 
-    if not feats:
+        # basic photometric vetting (tuned for your board images)
+        if e_hit >= 0.06 and sd_in <= 0.20 and contrast >= 0.05:
+            cands.append((x, y, r, float(e_hit)))
+
+    if not cands:
+        print("[DD] No disc candidates after photometric checks.")
         return []
-    print("[DD] feats inside playable area:", len(feats))
 
-
-    # ---------- Adaptive thresholds (looser floors based on your stats) ----------
-    e_scores  = np.array([f[4] for f in feats])  # perimeter edge hit rate
-    sd_vals   = np.array([f[5] for f in feats])  # interior std
-    ctr_vals  = np.array([f[6] for f in feats])  # interior vs ring contrast
-
-    # Floors/Ceilings tuned for weak-edges images
-    e_thr_floor = 0.04   # was 0.18 — your p50 is ~0.04
-    sd_thr_ceil = 0.18   # slightly stricter texture than 0.20
-    c_thr_floor = 0.06   # need some contrast, but not huge
-
-    e_thr  = max(e_thr_floor, float(np.percentile(e_scores, 20)))
-    sd_thr = min(sd_thr_ceil, float(np.percentile(sd_vals, 85)))
-    c_thr  = max(c_thr_floor, float(np.percentile(ctr_vals, 25)))
-
-    prelim = [(x, y, r, s, es, sd, ct) for (x, y, r, s, es, sd, ct) in feats
-          if (es >= e_thr and sd <= sd_thr and ct >= c_thr)]
-    if not prelim:
-        # last-resort fallback: circle-only mask + loose thresholds
-        mask_play_soft = _play_area_mask(straightened_img.shape, board_result,
-                                        inset_px=max(2, int(0.002*min_dim)))
-        feats2 = []
-        for x, y, r, s in keep:
-            if not (0 <= x < w and 0 <= y < h and mask_play_soft[y, x]):
-                continue
-            es = _perimeter_edge_score(edges_strong, x, y, r, n=36)
-            mu_in, sd_in, mu_out = _interior_stats(lum, x, y, r)
-            ct = abs(mu_in - mu_out)
-            feats2.append((x, y, r, s, es, sd_in, ct))
-        if feats2:
-            e_scores2 = np.array([f[4] for f in feats2])
-            sd_vals2  = np.array([f[5] for f in feats2])
-            ctr_vals2 = np.array([f[6] for f in feats2])
-            e_thr  = max(0.12, float(np.percentile(e_scores2, 20)))
-            sd_thr = min(0.30, float(np.percentile(sd_vals2, 80)))
-            c_thr  = max(0.010, float(np.percentile(ctr_vals2, 30)))
-            prelim = [(x,y,r,s,es,sd,ct) for (x,y,r,s,es,sd,ct) in feats2
-                    if (es >= e_thr and sd <= sd_thr and ct >= c_thr)]
-
-    if not prelim:
-        return []
-    print("[DD] prelim survivors:", len(prelim),
-      "| e_thr:", round(e_thr,3), "sd_thr:", round(sd_thr,3), "c_thr:", round(c_thr,3))
-
-    # ---------- Merge nearby survivors again (pick best edge score per group) ----------
-    prelim.sort(key=lambda t: t[4], reverse=True)  # sort by e_score
-    merged = []
-    for cand in prelim:
-        x, y, r, s, es, sd, ct = cand
-        keep_it = True
-        for (X, Y, R, ES) in merged:
+    # --- Non-max suppression on centres --------------------------------------
+    cands.sort(key=lambda t: t[3], reverse=True)
+    picked = []
+    for x, y, r, s in cands:
+        keep = True
+        for X, Y, R, S in picked:
             if np.hypot(x - X, y - Y) < 0.9 * max(r, R):
-                keep_it = False
+                keep = False
                 break
-        if keep_it:
-            merged.append((x, y, r, es))
-    
+        if keep:
+            picked.append((x, y, r, s))
 
-    print("[DD] merged:", len(merged))
+    if not picked:
+        print("[DD] All candidates suppressed by NMS.")
+        return []
+
+    # --- Colour features & two-cluster k-means -------------------------------
+    lab_img = color.rgb2lab(straightened_img.astype(float) / 255.0)
+    feats = [
+        _lab_patch_mean(lab_img, x, y,
+                        half=min(6, max(3, int(0.5 * r0))))
+        for (x, y, r, s) in picked
+    ]
+    team_labels, centroids = _kmeans2_lab(feats, seed=0)
+
+    # --- Build result list (radius snapped to r0) ----------------------------
+    r_use = int(round(r0))
+    results = []
+    for (x, y, r, s), labv, team in zip(picked, feats, team_labels):
+        results.append({
+            'center': (int(x), int(y)),
+            'radius': r_use,
+            'score': float(s),
+            'team': int(team),
+            'lab': labv,
+        })
+
+    # --- Debug overlay --------------------------------------------------------
+    if cfg.get("debug_show_discs", True):
+        debug_show_discs(straightened_img, results, board_result)
+
+    # Enforce cap
+    return results[:max_discs]
 
 
+def debug_show_discs(image, discs, board_result=None, title="Detected discs"):
+    """
+    Quick visualization of disc detections.
+    Draws a circle for each disc and labels it with its index.
+    Colours indicate team 0 vs 1 if available.
+    """
+    if image is None or len(discs) == 0:
+        print("[DD] No discs to visualize")
+        return
 
-    # ---------- Build output ----------
-    filtered = [{'center': (int(x), int(y)), 'radius': int(r), 'score': float(es)}
-                for (x, y, r, es) in merged]
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.imshow(image)
 
-    # Cap to max_discs
-    filtered = filtered[:cfg['max_discs']]
-    # In detect_discs temporarily print:
-    print("e_scores p25/p50:", np.percentile(e_scores, 25), np.percentile(e_scores, 50))
-    print("sd_vals  p50/p75:", np.percentile(sd_vals, 50),  np.percentile(sd_vals, 75))
-    print("ctr_vals p35/p50:", np.percentile(ctr_vals, 35), np.percentile(ctr_vals, 50))
+    # Show board centre and rings
+    if board_result is not None:
+        cx, cy = board_result['center']
+        ax.plot(cx, cy, 'rx', markersize=8, mew=2)
+        for name, r in board_result['rings'].items():
+            circ = patches.Circle(
+                (cx, cy), r,
+                linewidth=1.0,
+                edgecolor='white',
+                facecolor='none',
+                alpha=0.4
+            )
+            ax.add_patch(circ)
 
-    return filtered
+    for i, d in enumerate(discs):
+        x, y = d['center']
+        r = d['radius']
+        team = d.get('team', 0)
+        edge_col = 'cyan' if team == 0 else 'magenta'
+
+        circ = patches.Circle(
+            (x, y), r,
+            linewidth=2.0,
+            edgecolor=edge_col,
+            facecolor='none'
+        )
+        ax.add_patch(circ)
+        ax.text(
+            x, y, str(i),
+            color='yellow',
+            fontsize=9,
+            ha='center', va='center',
+            weight='bold'
+        )
+
+    ax.set_title(f"{title} (N={len(discs)})")
+    ax.axis('off')
+    plt.show()
 
 
 
