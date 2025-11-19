@@ -247,3 +247,133 @@ def correct_perspective(img, board_result):
     straightened = (straightened * 255).astype(np.uint8)
     
     return straightened, transform_info
+
+
+def create_scoring_regions(img_shape, board_result):
+    """
+    Create a segmentation mask with scoring regions based on detected rings.
+    
+    Returns a mask where pixel values represent point values:
+    0 = outside board (beyond outer ring)
+    5 = between ring_5 and ring_10
+    10 = between ring_10 and ring_15
+    15 = between ring_15 and center
+    20 = inside center hole
+    """
+    if board_result is None:
+        return None
+    
+    h, w = img_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    board_center = board_result['center']
+    detected_rings = board_result['rings']
+    
+    # Create coordinate grid
+    y, x = np.ogrid[:h, :w]
+    distances = np.sqrt((x - board_center[0])**2 + (y - board_center[1])**2)
+    
+    # Get ring radii (sorted from outer to inner)
+    outer_r = detected_rings.get('outer', None)
+    ring_5_r = detected_rings.get('ring_5', None)
+    ring_10_r = detected_rings.get('ring_10', None)
+    ring_15_r = detected_rings.get('ring_15', None)
+    center_r = detected_rings.get('center', None)
+    
+    # Everything starts at 0 (outside board)
+    # Assign scoring values to the spaces BETWEEN rings
+    # Ring radii from config: ring_5=0.95, ring_15=0.66, ring_10=0.33, center=0.05
+    
+    # Outside the outer ring = 0 (already set)
+    
+    # Between outer ring and ring_5 = still 0 (out of bounds)
+    # The outer ring boundary is the edge of the board
+    
+    # 5 point region: between ring_5 (0.95) and ring_15 (0.66)
+    if ring_5_r is not None and ring_15_r is not None:
+        mask[(distances <= ring_5_r) & (distances > ring_15_r)] = 5
+    
+    # 10 point region: between ring_15 (0.66) and ring_10 (0.33)
+    if ring_15_r is not None and ring_10_r is not None:
+        mask[(distances <= ring_15_r) & (distances > ring_10_r)] = 10
+    
+    # 15 point region: between ring_10 (0.33) and center (0.05)
+    if ring_10_r is not None and center_r is not None:
+        mask[(distances <= ring_10_r) & (distances > center_r)] = 15
+    
+    # 20 point region: inside center hole (0.05)
+    if center_r is not None:
+        mask[distances <= center_r] = 20
+    
+    return mask
+
+
+def visualize_scoring_regions(img, scoring_mask):
+    """
+    Visualize the scoring regions with colored overlay.
+    Each scoring region gets a distinct color.
+    """
+    if scoring_mask is None:
+        print("No scoring mask to visualize")
+        return
+    
+    # Define colors for each scoring region (RGB)
+    region_colors = {
+        0: [50, 50, 50],      # Outside - dark gray
+        5: [100, 200, 100],   # Outer ring (5pt) - light green
+        10: [255, 200, 100],  # Middle ring (10pt) - orange
+        15: [255, 255, 100],  # Inner ring (15pt) - yellow
+        20: [255, 100, 100]   # Center (20pt) - red
+    }
+    
+    # Create colored overlay
+    overlay = np.zeros((*scoring_mask.shape, 3), dtype=np.uint8)
+    for score_value, rgb_color in region_colors.items():
+        mask_region = scoring_mask == score_value
+        overlay[mask_region] = rgb_color
+    
+    # Blend with original image
+    alpha = 0.5
+    if len(img.shape) == 3:
+        blended = (alpha * img + (1 - alpha) * overlay).astype(np.uint8)
+    else:
+        img_rgb = np.stack([img, img, img], axis=2)
+        blended = (alpha * img_rgb + (1 - alpha) * overlay).astype(np.uint8)
+    
+    # Display
+    _, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    axes[0].imshow(img)
+    axes[0].set_title("Original Image")
+    axes[0].axis('off')
+    
+    axes[1].imshow(overlay)
+    axes[1].set_title("Scoring Regions Mask")
+    axes[1].axis('off')
+    
+    axes[2].imshow(blended)
+    axes[2].set_title("Blended Overlay")
+    axes[2].axis('off')
+    
+    # Add legend
+    unique_scores = np.unique(scoring_mask)
+    legend_text = "Scoring Regions:\n"
+    for score in sorted(unique_scores):
+        if score == 0:
+            legend_text += f"  {score}pt: Outside board\n"
+        elif score == 20:
+            legend_text += f"  {score}pt: Center hole\n"
+        else:
+            legend_text += f"  {score}pt: Ring\n"
+    
+    plt.figtext(0.5, 0.02, legend_text, ha='center', fontsize=10, 
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"Scoring regions: {sorted(unique_scores)} points")
+    for score in sorted(unique_scores):
+        count = np.sum(scoring_mask == score)
+        percentage = (count / scoring_mask.size) * 100
+        print(f"  {score}pt region: {count} pixels ({percentage:.1f}%)")
