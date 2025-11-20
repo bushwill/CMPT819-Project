@@ -38,21 +38,6 @@ def display_images(images, titles=None, figsize=(14, 7)):
     plt.show()
 
 
-def display_transform_info(transform_info, n_rings):
-    """Display information about perspective transformation."""
-    print(f"Perspective correction computed from {n_rings * 50} point correspondences")
-    
-    if transform_info['applied']:
-        print(f"\nTransformation applied:")
-        print(f"  Overall magnitude: {transform_info['magnitude']:.4f}")
-        print(f"  Perspective distortion: {transform_info['perspective_strength']:.4f}")
-        if transform_info['perspective_strength'] > 0.001:
-            print(f"  → Significant perspective correction applied")
-        else:
-            print(f"  → Minor adjustments only (near-orthogonal view)")
-    else:
-        print(f"\nNo significant transformation needed (image already orthogonal)")
-
 
 def detect_edges(img, config):
     """Detect edges using Canny edge detection."""
@@ -66,143 +51,8 @@ def detect_edges(img, config):
     )
     return edges
 
-
-def detect_board_and_rings_ellipse(edges, config):
-    """Detect board rings using ellipse detection (fallback for non-orthogonal views).
-    Returns board_result with detected ellipses, or None if pattern not found."""
-    h, w = edges.shape[:2]
-    
-    ellipse_cfg = config['ellipse_detection']
-    ring_ratios = config['ring_ratios']
-    ring_search_cfg = config['ring_search']
-    
-    print("Attempting ellipse detection (non-orthogonal view detected)...")
-    
-    # Estimate size range based on image dimensions
-    min_size = max(ellipse_cfg['min_size'], int(min(h, w) * 0.1))
-    max_size = int(min(h, w) * 0.9)
-    
-    try:
-        # Suppress warnings from ellipse detection
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            
-            # Detect ellipses using Hough transform
-            result = transform.hough_ellipse(
-                edges,
-                threshold=int(ellipse_cfg['threshold'] * 255),
-                accuracy=ellipse_cfg['accuracy'],
-                min_size=min_size,
-                max_size=max_size
-            )
-            
-            # Sort by accumulator value (confidence)
-            result = sorted(result, key=lambda x: x[5], reverse=True)
-            
-            # Filter by eccentricity and take top candidates
-            ellipse_candidates = []
-            for ellipse in result[:ellipse_cfg['num_peaks']]:
-                yc, xc, a, b, orientation, acc = ellipse
-                
-                # Calculate eccentricity: e = sqrt(1 - (b/a)^2) for a >= b
-                semi_major = max(a, b)
-                semi_minor = min(a, b)
-                if semi_major > 0:
-                    eccentricity = np.sqrt(1 - (semi_minor / semi_major) ** 2)
-                else:
-                    continue
-                    
-                if eccentricity <= ellipse_cfg['max_eccentricity']:
-                    ellipse_candidates.append({
-                        'center': (int(xc), int(yc)),
-                        'semi_major': int(semi_major),
-                        'semi_minor': int(semi_minor),
-                        'orientation': orientation,
-                        'eccentricity': eccentricity,
-                        'acc': acc
-                    })
-            
-            if len(ellipse_candidates) == 0:
-                print("No valid ellipses found")
-                return None
-            
-            print(f"Found {len(ellipse_candidates)} ellipse candidates")
-            
-            # Try pattern matching using ring_5 as reference
-            # Sort by semi_major axis (largest first, as ring_5 should be largest)
-            ellipse_candidates.sort(key=lambda x: x['semi_major'], reverse=True)
-            
-            for ring5_candidate in ellipse_candidates:
-                ring5_center = ring5_candidate['center']
-                ring5_major = ring5_candidate['semi_major']
-                
-                # Calculate expected outer radius (assuming ellipse represents ring_5)
-                board_radius = int(ring5_major / ring_ratios['ring_5'])
-                board_center = ring5_center
-                
-                detected_rings = {
-                    'ring_5': ring5_major  # Use semi-major axis as reference
-                }
-                max_offset = board_radius * ring_search_cfg['max_center_offset']
-                
-                # Match remaining 3 inner rings
-                inner_ratios = {k: v for k, v in ring_ratios.items() if k != 'ring_5'}
-                sorted_rings = sorted(inner_ratios.items(), key=lambda x: x[1], reverse=True)
-                
-                for ring_name, ratio in sorted_rings:
-                    expected_major = int(board_radius * ratio)
-                    tol = int(expected_major * ring_search_cfg['tolerance'])
-                    
-                    # Find best matching ellipse
-                    best_match = None
-                    best_diff = float('inf')
-                    
-                    for ellipse in ellipse_candidates:
-                        # Check size match (using semi-major axis)
-                        if abs(ellipse['semi_major'] - expected_major) > tol:
-                            continue
-                        
-                        # Check center proximity
-                        dist = np.hypot(ellipse['center'][0] - board_center[0],
-                                       ellipse['center'][1] - board_center[1])
-                        if dist > max_offset:
-                            continue
-                        
-                        # Track best match
-                        diff = abs(ellipse['semi_major'] - expected_major)
-                        if diff < best_diff:
-                            best_diff = diff
-                            best_match = ellipse
-                    
-                    if best_match is not None:
-                        detected_rings[ring_name] = expected_major
-                    else:
-                        break
-                
-                # Check if we found all 4 rings
-                if len(detected_rings) == 4:
-                    outer_radius = board_radius
-                    print(f"Board found via ellipse detection: center={board_center}, outer_radius={outer_radius}")
-                    print(f"  Detected 4 rings: {', '.join(detected_rings.keys())}")
-                    print(f"  Note: Perspective correction recommended for accurate scoring")
-                    return {
-                        'center': board_center,
-                        'radius': outer_radius,
-                        'rings': detected_rings,
-                        'ellipse_detection': True  # Flag indicating ellipse detection was used
-                    }
-            
-            print("No valid board pattern found with ellipse detection")
-            return None
-            
-    except Exception as e:
-        print(f"Ellipse detection failed: {e}")
-        return None
-
-
 def detect_board_and_rings(edges, config):
     """Detect board and rings using ring_5 as primary reference. 
-    Falls back to ellipse detection for non-orthogonal views.
     Returns None if not a valid board."""
     h, w = edges.shape[:2]
     
@@ -216,16 +66,17 @@ def detect_board_and_rings(edges, config):
     max_radius = int(min(h, w) * board_cfg['max_circle_ratio'])
     
     # Search all radii from 5% to max_radius in one shot
+    # Use step_size from config (calculated dynamically based on image dimensions)
     min_inner = int(min_radius * 0.05)
     all_radii = np.arange(min_inner, max_radius, ring_search_cfg['step_size'])
     
-    print(f"Running single Hough transform for {len(all_radii)} radii...")
+    print(f"Running single Hough transform for {len(all_radii)} radii (step_size={ring_search_cfg['step_size']})...")
     hough_res = transform.hough_circle(edges, all_radii)
     accums, cx, cy, radii_detected = transform.hough_circle_peaks(hough_res, all_radii, total_num_peaks=100)
     
     if len(cx) == 0:
-        print("No circles found, trying ellipse detection...")
-        return detect_board_and_rings_ellipse(edges, config)
+        print("No circles found")
+        return None
     
     print(f"Found {len(cx)} circle candidates, filtering...")
     
@@ -305,8 +156,8 @@ def detect_board_and_rings(edges, config):
                 'rings': detected_rings  # Only the 4 detected rings
             }
     
-    print("No valid board pattern found with circles, trying ellipse detection...")
-    return detect_board_and_rings_ellipse(edges, config)
+    print("No valid board pattern found")
+    return None
 
 
 def visualize_board_detection(img, board_result):
@@ -341,75 +192,6 @@ def visualize_board_detection(img, board_result):
     ax.axis('off')
     plt.show()
 
-
-def correct_perspective(img, board_result):
-    """
-    Correct perspective distortion by registering detected rings to perfect circles.
-    
-    The detected rings are actually ellipses due to perspective, but Hough circles
-    fit circles to them. We sample points from these detected "circles" (which follow
-    the elliptical edges) and map them to perfect circles at the same radii.
-    """
-    if board_result is None:
-        return None, None
-    
-    detected_center = board_result['center']
-    detected_rings = board_result['rings']
-    
-    # Sample points around each detected ring
-    def sample_ring_points(center, radius, n_points=50):
-        angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
-        points = []
-        for angle in angles:
-            x = center[0] + radius * np.cos(angle)
-            y = center[1] + radius * np.sin(angle)
-            points.append([x, y])
-        return np.array(points)
-    
-    # Collect point correspondences from all rings
-    src_points = []  # Detected positions (elliptical in reality)
-    dst_points = []  # Target positions (perfect circles)
-    
-    for ring_name, radius in detected_rings.items():
-        # Source: sample points from detected ring (follows ellipse due to perspective)
-        ring_src = sample_ring_points(detected_center, radius, n_points=50)
-        src_points.append(ring_src)
-        
-        # Destination: same points but on perfect circle (orthogonal view)
-        ring_dst = sample_ring_points(detected_center, radius, n_points=50)
-        dst_points.append(ring_dst)
-    
-    # Combine all points from all rings
-    src_points = np.vstack(src_points)
-    dst_points = np.vstack(dst_points)
-    
-    # Compute projective transformation (homography)
-    # This maps the elliptical rings → circular rings
-    tform = transform.ProjectiveTransform()
-    tform.estimate(src_points, dst_points)
-    
-    # Analyze transformation magnitude
-    # Compare identity matrix to actual transformation
-    identity = np.eye(3)
-    diff = np.linalg.norm(tform.params - identity)
-    
-    # Check for perspective distortion (non-zero off-diagonal elements in last row)
-    perspective_strength = np.linalg.norm(tform.params[2, :2])
-    
-    transform_info = {
-        'applied': diff > 0.01,  # Significant transformation applied
-        'magnitude': diff,
-        'perspective_strength': perspective_strength,
-        'matrix': tform.params
-    }
-    
-    # Warp the image to correct perspective
-    straightened = transform.warp(img, tform.inverse, output_shape=img.shape)
-    
-    # Convert back to uint8 for display
-    straightened = (straightened * 255).astype(np.uint8)
-    
-    return straightened, transform_info
 
 
 def create_scoring_regions(img_shape, board_result):
