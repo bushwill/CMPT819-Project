@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from skimage import color, feature, transform, draw, filters, measure, morphology, exposure
 from matplotlib import patches
 from dataclasses import dataclass
+import warnings
 
 
 def display_image(img, title="Image", figsize=(8, 8)):
@@ -66,85 +67,246 @@ def detect_edges(img, config):
     return edges
 
 
+def detect_board_and_rings_ellipse(edges, config):
+    """Detect board rings using ellipse detection (fallback for non-orthogonal views).
+    Returns board_result with detected ellipses, or None if pattern not found."""
+    h, w = edges.shape[:2]
+    
+    ellipse_cfg = config['ellipse_detection']
+    ring_ratios = config['ring_ratios']
+    ring_search_cfg = config['ring_search']
+    
+    print("Attempting ellipse detection (non-orthogonal view detected)...")
+    
+    # Estimate size range based on image dimensions
+    min_size = max(ellipse_cfg['min_size'], int(min(h, w) * 0.1))
+    max_size = int(min(h, w) * 0.9)
+    
+    try:
+        # Suppress warnings from ellipse detection
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            # Detect ellipses using Hough transform
+            result = transform.hough_ellipse(
+                edges,
+                threshold=int(ellipse_cfg['threshold'] * 255),
+                accuracy=ellipse_cfg['accuracy'],
+                min_size=min_size,
+                max_size=max_size
+            )
+            
+            # Sort by accumulator value (confidence)
+            result = sorted(result, key=lambda x: x[5], reverse=True)
+            
+            # Filter by eccentricity and take top candidates
+            ellipse_candidates = []
+            for ellipse in result[:ellipse_cfg['num_peaks']]:
+                yc, xc, a, b, orientation, acc = ellipse
+                
+                # Calculate eccentricity: e = sqrt(1 - (b/a)^2) for a >= b
+                semi_major = max(a, b)
+                semi_minor = min(a, b)
+                if semi_major > 0:
+                    eccentricity = np.sqrt(1 - (semi_minor / semi_major) ** 2)
+                else:
+                    continue
+                    
+                if eccentricity <= ellipse_cfg['max_eccentricity']:
+                    ellipse_candidates.append({
+                        'center': (int(xc), int(yc)),
+                        'semi_major': int(semi_major),
+                        'semi_minor': int(semi_minor),
+                        'orientation': orientation,
+                        'eccentricity': eccentricity,
+                        'acc': acc
+                    })
+            
+            if len(ellipse_candidates) == 0:
+                print("No valid ellipses found")
+                return None
+            
+            print(f"Found {len(ellipse_candidates)} ellipse candidates")
+            
+            # Try pattern matching using ring_5 as reference
+            # Sort by semi_major axis (largest first, as ring_5 should be largest)
+            ellipse_candidates.sort(key=lambda x: x['semi_major'], reverse=True)
+            
+            for ring5_candidate in ellipse_candidates:
+                ring5_center = ring5_candidate['center']
+                ring5_major = ring5_candidate['semi_major']
+                
+                # Calculate expected outer radius (assuming ellipse represents ring_5)
+                board_radius = int(ring5_major / ring_ratios['ring_5'])
+                board_center = ring5_center
+                
+                detected_rings = {
+                    'ring_5': ring5_major  # Use semi-major axis as reference
+                }
+                max_offset = board_radius * ring_search_cfg['max_center_offset']
+                
+                # Match remaining 3 inner rings
+                inner_ratios = {k: v for k, v in ring_ratios.items() if k != 'ring_5'}
+                sorted_rings = sorted(inner_ratios.items(), key=lambda x: x[1], reverse=True)
+                
+                for ring_name, ratio in sorted_rings:
+                    expected_major = int(board_radius * ratio)
+                    tol = int(expected_major * ring_search_cfg['tolerance'])
+                    
+                    # Find best matching ellipse
+                    best_match = None
+                    best_diff = float('inf')
+                    
+                    for ellipse in ellipse_candidates:
+                        # Check size match (using semi-major axis)
+                        if abs(ellipse['semi_major'] - expected_major) > tol:
+                            continue
+                        
+                        # Check center proximity
+                        dist = np.hypot(ellipse['center'][0] - board_center[0],
+                                       ellipse['center'][1] - board_center[1])
+                        if dist > max_offset:
+                            continue
+                        
+                        # Track best match
+                        diff = abs(ellipse['semi_major'] - expected_major)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_match = ellipse
+                    
+                    if best_match is not None:
+                        detected_rings[ring_name] = expected_major
+                    else:
+                        break
+                
+                # Check if we found all 4 rings
+                if len(detected_rings) == 4:
+                    outer_radius = board_radius
+                    print(f"Board found via ellipse detection: center={board_center}, outer_radius={outer_radius}")
+                    print(f"  Detected 4 rings: {', '.join(detected_rings.keys())}")
+                    print(f"  Note: Perspective correction recommended for accurate scoring")
+                    return {
+                        'center': board_center,
+                        'radius': outer_radius,
+                        'rings': detected_rings,
+                        'ellipse_detection': True  # Flag indicating ellipse detection was used
+                    }
+            
+            print("No valid board pattern found with ellipse detection")
+            return None
+            
+    except Exception as e:
+        print(f"Ellipse detection failed: {e}")
+        return None
+
+
 def detect_board_and_rings(edges, config):
-    """Detect outer board circle and inner rings. Returns None if not a valid board."""
+    """Detect board and rings using ring_5 as primary reference. 
+    Falls back to ellipse detection for non-orthogonal views.
+    Returns None if not a valid board."""
     h, w = edges.shape[:2]
     
     board_cfg = config['board_detection']
     ring_ratios = config['ring_ratios']
     ring_search_cfg = config['ring_search']
+    validation_cfg = config['board_validation']
     
-    # Detect outer board circle
+    # OPTIMIZATION: Do ALL Hough transforms upfront
     min_radius = int(min(h, w) * board_cfg['min_circle_ratio'])
     max_radius = int(min(h, w) * board_cfg['max_circle_ratio'])
-    radii = np.arange(min_radius, max_radius, board_cfg['radius_step'])
     
-    hough_res = transform.hough_circle(edges, radii)
-    accums, cx, cy, radii_detected = transform.hough_circle_peaks(hough_res, radii, total_num_peaks=1)
+    # Search all radii from 5% to max_radius in one shot
+    min_inner = int(min_radius * 0.05)
+    all_radii = np.arange(min_inner, max_radius, ring_search_cfg['step_size'])
+    
+    print(f"Running single Hough transform for {len(all_radii)} radii...")
+    hough_res = transform.hough_circle(edges, all_radii)
+    accums, cx, cy, radii_detected = transform.hough_circle_peaks(hough_res, all_radii, total_num_peaks=100)
     
     if len(cx) == 0:
-        return None
+        print("No circles found, trying ellipse detection...")
+        return detect_board_and_rings_ellipse(edges, config)
     
-    board_center = (int(cx[0]), int(cy[0]))
-    board_radius = int(radii_detected[0])
+    print(f"Found {len(cx)} circle candidates, filtering...")
     
-    # Detect inner rings
-    min_search_r = int(board_radius * 0.05)
-    max_search_r = int(board_radius * 0.98)
-    search_radii = np.arange(min_search_r, max_search_r, ring_search_cfg['step_size'])
+    # Build lookup of all detected circles
+    all_circles = []
+    for x, y, r, acc in zip(cx, cy, radii_detected, accums):
+        all_circles.append({
+            'center': (int(x), int(y)),
+            'radius': int(r),
+            'acc': float(acc)
+        })
     
-    hough_res = transform.hough_circle(edges, search_radii)
-    accums, cx, cy, radii_det = transform.hough_circle_peaks(hough_res, search_radii, total_num_peaks=30)
+    # Get ring_5 candidates (should be around 95% of outer, so large radii)
+    # ring_5 is the PRIMARY REFERENCE ring, outer board edge is calculated
+    ring5_min = int(min_radius * 0.95)  # Approximate minimum for ring_5
+    ring5_candidates = [c for c in all_circles if c['radius'] >= ring5_min]
+    ring5_candidates.sort(key=lambda x: x['radius'], reverse=True)
     
-    # Filter candidates near board center
-    max_offset = board_radius * ring_search_cfg['max_center_offset']
-    candidates = []
-    for x, y, r, acc in zip(cx, cy, radii_det, accums):
-        dist = np.hypot(x - board_center[0], y - board_center[1])
-        if dist < max_offset:
-            candidates.append({
-                'radius': r,
-                'center': (x, y),
-                'accumulator': acc
-            })
-    
-    candidates.sort(key=lambda x: x['radius'])
-    
-    detected_rings = {'outer': board_radius}
-    used_candidates = set()
-    
-    # Match candidates to expected ring ratios
-    inner_ratios = {k: v for k, v in ring_ratios.items() if k != 'outer'}
-    sorted_rings = sorted(inner_ratios.items(), key=lambda x: x[1], reverse=True)
-    
-    for ring_name, ratio in sorted_rings:
-        expected_r = int(board_radius * ratio)
-        tol = expected_r * ring_search_cfg['tolerance']
+    # Try pattern matching using each ring_5 candidate as reference
+    for ring5_candidate in ring5_candidates:
+        ring5_center = ring5_candidate['center']
+        ring5_radius = ring5_candidate['radius']
         
-        best_match = None
-        best_diff = float('inf')
-        best_idx = None
-        for idx, c in enumerate(candidates):
-            if idx in used_candidates:
-                continue
-            diff = abs(c['radius'] - expected_r)
-            if diff < tol and diff < best_diff:
-                best_diff = diff
-                best_match = c
-                best_idx = idx
+        # Calculate what the outer board radius should be (NOT detected)
+        board_radius = int(ring5_radius / ring_ratios['ring_5'])
+        board_center = ring5_center
         
-        if best_match is not None:
-            detected_rings[ring_name] = best_match['radius']
-            used_candidates.add(best_idx)
+        # Only store detected rings (ring_5 + 3 inner)
+        detected_rings = {
+            'ring_5': ring5_radius
+        }
+        max_offset = board_radius * ring_search_cfg['max_center_offset']
+        
+        # Match remaining 3 inner rings (ring_15, ring_10, center)
+        inner_ratios = {k: v for k, v in ring_ratios.items() if k != 'ring_5'}
+        sorted_rings = sorted(inner_ratios.items(), key=lambda x: x[1], reverse=True)
+        
+        for ring_name, ratio in sorted_rings:
+            expected_r = int(board_radius * ratio)
+            tol = int(expected_r * ring_search_cfg['tolerance'])
+            
+            # Find best matching circle from pre-computed results
+            best_match = None
+            best_diff = float('inf')
+            
+            for circle in all_circles:
+                # Check radius match
+                if abs(circle['radius'] - expected_r) > tol:
+                    continue
+                
+                # Check center proximity
+                dist = np.hypot(circle['center'][0] - board_center[0], 
+                               circle['center'][1] - board_center[1])
+                if dist > max_offset:
+                    continue
+                
+                # Track best match
+                diff = abs(circle['radius'] - expected_r)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_match = circle
+            
+            if best_match is not None:
+                detected_rings[ring_name] = expected_r  # Use exact expected radius
+            else:
+                break  # Pattern invalid
+        
+        # Check if we found all 4 rings (ring_5 + 3 inner: ring_15, ring_10, center)
+        if len(detected_rings) == 4:
+            # Calculate outer radius for scoring (not detected)
+            outer_radius = board_radius
+            print(f"Board found: center={board_center}, outer_radius={outer_radius} (calculated from ring_5={ring5_radius})")
+            print(f"  Detected 4 rings: {', '.join(detected_rings.keys())}")
+            return {
+                'center': board_center,
+                'radius': outer_radius,  # Calculated outer radius for scoring
+                'rings': detected_rings  # Only the 4 detected rings
+            }
     
-    if len(detected_rings) < 4:
-        return None
-    
-    return {
-        'center': board_center,
-        'radius': board_radius,
-        'rings': detected_rings
-    }
+    print("No valid board pattern found with circles, trying ellipse detection...")
+    return detect_board_and_rings_ellipse(edges, config)
 
 
 def visualize_board_detection(img, board_result):
@@ -156,10 +318,9 @@ def visualize_board_detection(img, board_result):
     detected_rings = board_result['rings']
     
     colors = {
-        'outer': [0, 255, 0],
+        'ring_5': [255, 0, 0],
         'ring_15': [255, 255, 0],
         'ring_10': [255, 165, 0],
-        'ring_5': [255, 0, 0],
         'center': [0, 0, 255]
     }
     
@@ -256,11 +417,13 @@ def create_scoring_regions(img_shape, board_result):
     Create a segmentation mask with scoring regions based on detected rings.
     
     Returns a mask where pixel values represent point values:
-    0 = outside board (beyond outer ring)
-    5 = between ring_5 and ring_10
-    10 = between ring_10 and ring_15
-    15 = between ring_15 and center
+    0 = outside board (beyond ring_5)
+    5 = between ring_5 and ring_15
+    10 = between ring_15 and ring_10
+    15 = between ring_10 and center
     20 = inside center hole
+    
+    Note: Uses board_result['radius'] as the calculated board boundary from ring_5.
     """
     if board_result is None:
         return None
@@ -269,41 +432,35 @@ def create_scoring_regions(img_shape, board_result):
     mask = np.zeros((h, w), dtype=np.uint8)
     
     board_center = board_result['center']
+    board_radius = board_result['radius']  # Calculated from ring_5
     detected_rings = board_result['rings']
     
     # Create coordinate grid
     y, x = np.ogrid[:h, :w]
     distances = np.sqrt((x - board_center[0])**2 + (y - board_center[1])**2)
     
-    # Get ring radii (sorted from outer to inner)
-    outer_r = detected_rings.get('outer', None)
+    # Get ring radii from detected rings
     ring_5_r = detected_rings.get('ring_5', None)
-    ring_10_r = detected_rings.get('ring_10', None)
     ring_15_r = detected_rings.get('ring_15', None)
+    ring_10_r = detected_rings.get('ring_10', None)
     center_r = detected_rings.get('center', None)
     
     # Everything starts at 0 (outside board)
     # Assign scoring values to the spaces BETWEEN rings
-    # Ring radii from config: ring_5=0.95, ring_15=0.66, ring_10=0.33, center=0.05
     
-    # Outside the outer ring = 0 (already set)
-    
-    # Between outer ring and ring_5 = still 0 (out of bounds)
-    # The outer ring boundary is the edge of the board
-    
-    # 5 point region: between ring_5 (0.95) and ring_15 (0.66)
+    # 5 point region: between ring_5 and ring_15
     if ring_5_r is not None and ring_15_r is not None:
         mask[(distances <= ring_5_r) & (distances > ring_15_r)] = 5
     
-    # 10 point region: between ring_15 (0.66) and ring_10 (0.33)
+    # 10 point region: between ring_15 and ring_10
     if ring_15_r is not None and ring_10_r is not None:
         mask[(distances <= ring_15_r) & (distances > ring_10_r)] = 10
     
-    # 15 point region: between ring_10 (0.33) and center (0.05)
+    # 15 point region: between ring_10 and center
     if ring_10_r is not None and center_r is not None:
         mask[(distances <= ring_10_r) & (distances > center_r)] = 15
     
-    # 20 point region: inside center hole (0.05)
+    # 20 point region: inside center hole
     if center_r is not None:
         mask[distances <= center_r] = 20
     
@@ -399,20 +556,15 @@ def _expected_disc_radius(board_result, pad_frac=0.10, min_px=4):
 
 def _play_area_mask(shape, board_result, inset_px=4):
     """
-    Inside the playable wood (<= ring_5). If ring_5 is missing, use 0.95*outer.
+    Inside the playable wood (<= ring_5).
     """
     h, w = shape[:2]
     yy, xx = np.mgrid[0:h, 0:w]
     cx, cy = board_result['center']
     rings = board_result['rings']
-    rout = float(rings.get('outer', 0.0))
-    r5   = float(rings.get('ring_5', 0.95 * rout if rout > 0 else 0.0))
+    r5 = float(rings.get('ring_5', 0.0))
 
-    r_play_outer = r5 if r5 > 0 else rout
-    if rout > 0 and r5 > 0:
-        r_play_outer = min(r5, rout)
-
-    r_play_outer = max(0.0, r_play_outer - inset_px)
+    r_play_outer = max(0.0, r5 - inset_px) if r5 > 0 else 0.0
     dist = np.hypot(xx - cx, yy - cy)
     return dist <= r_play_outer
 
@@ -759,7 +911,7 @@ def calculate_disc_scores(discs, mask, line_band, board_info):
     h, w = mask.shape
     cx, cy = board_info['center']
     r_center = board_info['radii']['center']
-    r_outer = board_info['radii']['outer']
+    r_ring5 = board_info['radii']['ring_5']  # Use ring_5 as playable boundary
 
     for i, d in enumerate(discs):
         x, y = d['center']
@@ -806,7 +958,7 @@ def calculate_disc_scores(discs, mask, line_band, board_info):
             flags.append('line_touch')
 
         # sanity checks
-        if (center_dist + r) > (r_outer + 1):
+        if (center_dist + r) > (r_ring5 + 1):  # Outside ring_5 (playable boundary)
             base_score = 0
             flags.append('outside')
 
