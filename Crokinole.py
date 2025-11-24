@@ -59,6 +59,42 @@ def preprocess_image(img, target_size=None, max_dimension=1200):
     return img
 
 
+def balance_colors(image):
+    """
+    Apply color balancing using histogram equalization per channel.
+    This spreads out color values to make input more consistent across different lighting conditions.
+    
+    Uses adaptive histogram equalization (CLAHE) for better local contrast while
+    maintaining global color balance.
+    
+    Args:
+        image: Input RGB image (uint8)
+    
+    Returns:
+        Color-balanced image (uint8)
+    """
+    # Convert to float [0, 1] for processing
+    img_float = image.astype(float) / 255.0
+    
+    # Convert to LAB color space (better for color processing than RGB)
+    img_lab = color.rgb2lab(img_float)
+    
+    # Apply adaptive histogram equalization to L channel (luminance)
+    # This preserves colors while balancing brightness
+    img_lab[:, :, 0] = exposure.equalize_adapthist(
+        img_lab[:, :, 0] / 100.0,  # Normalize L channel to [0, 1]
+        clip_limit=0.03  # Limit contrast enhancement to avoid over-processing
+    ) * 100.0  # Scale back to LAB range
+    
+    # Convert back to RGB
+    img_balanced = color.lab2rgb(img_lab)
+    
+    # Convert back to uint8
+    img_balanced = (np.clip(img_balanced, 0, 1) * 255).astype(np.uint8)
+    
+    return img_balanced
+
+
 def display_image(img, title="Image", figsize=(8, 8)):
     """Display a single image with optional title."""
     plt.figure(figsize=figsize)
