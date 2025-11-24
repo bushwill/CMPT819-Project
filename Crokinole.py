@@ -9,20 +9,88 @@ from skimage import color, feature, transform, draw, filters, measure, morpholog
 from matplotlib import patches
 from dataclasses import dataclass
 
-def _ring_radius_with_fallback(detected_rings, name, outer_r, ring_ratios):
+def preprocess_image(img, target_size=None, max_dimension=1200):
     """
-    Return radius for ring `name`.
+    Preprocess image for optimal processing:
+    - Resize if too large (to improve performance)
+    - Ensure proper formatting (RGB, uint8)
+    - Normalize dimensions for consistent processing
+    
+    Args:
+        img: Input image (any format)
+        target_size: Tuple (height, width) for exact resizing, or None for auto
+        max_dimension: Maximum dimension (height or width) if target_size is None
+    
+    Returns:
+        Preprocessed image (RGB, uint8, appropriate dimensions)
+    """
+    # Convert to RGB if grayscale or RGBA
+    if len(img.shape) == 2:
+        img = color.gray2rgb(img)
+    elif img.shape[2] == 4:
+        img = color.rgba2rgb(img)
+    
+    # Ensure uint8 format
+    if img.dtype != np.uint8:
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+    
+    # Resize if needed
+    h, w = img.shape[:2]
+    
+    if target_size is not None:
+        # Exact size specified
+        if (h, w) != target_size:
+            img = transform.resize(img, target_size, anti_aliasing=True, preserve_range=True).astype(np.uint8)
+            print(f"Image resized to exact dimensions: {target_size}")
+    elif max(h, w) > max_dimension:
+        # Auto-resize to max_dimension while preserving aspect ratio
+        scale = max_dimension / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        img = transform.resize(img, (new_h, new_w), anti_aliasing=True, preserve_range=True).astype(np.uint8)
+        print(f"Image resized from ({h}, {w}) to ({new_h}, {new_w}) for optimal processing")
+    else:
+        print(f"Image dimensions ({h}, {w}) are within acceptable range")
+    
+    return img
 
-    If that ring wasn't detected, approximate it as:
-        outer_r * ring_ratios[name]
-    where ring_ratios comes from CONFIG['ring_ratios'].
+def balance_colors(image):
     """
-    r = detected_rings.get(name, None)
-    if r is None and outer_r is not None:
-        ratio = ring_ratios.get(name, None)
-        if ratio is not None:
-            r = int(outer_r * ratio)
-    return r
+    Apply color balancing using histogram equalization per channel.
+    This spreads out color values to make input more consistent across different lighting conditions.
+    
+    Uses adaptive histogram equalization (CLAHE) for better local contrast while
+    maintaining global color balance.
+    
+    Args:
+        image: Input RGB image (uint8)
+    
+    Returns:
+        Color-balanced image (uint8)
+    """
+    # Convert to float [0, 1] for processing
+    img_float = image.astype(float) / 255.0
+    
+    # Convert to LAB color space (better for color processing than RGB)
+    img_lab = color.rgb2lab(img_float)
+    
+    # Apply adaptive histogram equalization to L channel (luminance)
+    # This preserves colors while balancing brightness
+    img_lab[:, :, 0] = exposure.equalize_adapthist(
+        img_lab[:, :, 0] / 100.0,  # Normalize L channel to [0, 1]
+        clip_limit=0.03  # Limit contrast enhancement to avoid over-processing
+    ) * 100.0  # Scale back to LAB range
+    
+    # Convert back to RGB
+    img_balanced = color.lab2rgb(img_lab)
+    
+    # Convert back to uint8
+    img_balanced = (np.clip(img_balanced, 0, 1) * 255).astype(np.uint8)
+    
+    return img_balanced
+
 
 def display_image(img, title="Image", figsize=(8, 8)):
     """Display a single image with optional title."""
@@ -51,41 +119,11 @@ def display_images(images, titles=None, figsize=(14, 7)):
     plt.show()
 
 
-def display_transform_info(transform_info, n_rings):
-    """Display information about perspective transformation."""
-    print(f"Perspective correction computed from {n_rings * 50} point correspondences")
-    
-    if transform_info['applied']:
-        print(f"\nTransformation applied:")
-        print(f"  Overall magnitude: {transform_info['magnitude']:.4f}")
-        print(f"  Perspective distortion: {transform_info['perspective_strength']:.4f}")
-        if transform_info['perspective_strength'] > 0.001:
-            print(f"  → Significant perspective correction applied")
-        else:
-            print(f"  → Minor adjustments only (near-orthogonal view)")
-    else:
-        print(f"\nNo significant transformation needed (image already orthogonal)")
-
 
 def detect_edges(img, config):
     """Detect edges using Canny edge detection."""
     board_cfg = config['board_detection']
-
-    # Handle grayscale, RGB, and RGBA safely
-    if img.ndim == 2:
-        # Already grayscale
-        gray_image = img
-    else:
-        # If image has an alpha channel, drop/convert it
-        if img.shape[-1] == 4:
-            # Option A: use rgba2rgb to blend with white background
-            img_rgb = color.rgba2rgb(img)
-            # Option B (simpler): img_rgb = img[..., :3]
-        else:
-            img_rgb = img
-
-        gray_image = color.rgb2gray(img_rgb)
-
+    gray_image = color.rgb2gray(img)
     edges = feature.canny(
         gray_image,
         low_threshold=board_cfg['canny_low_threshold'],
@@ -94,91 +132,113 @@ def detect_edges(img, config):
     )
     return edges
 
-
-
 def detect_board_and_rings(edges, config):
-    """Detect outer board circle and inner rings. Returns None if not a valid board."""
+    """Detect board and rings using ring_5 as primary reference. 
+    Returns None if not a valid board."""
     h, w = edges.shape[:2]
     
     board_cfg = config['board_detection']
     ring_ratios = config['ring_ratios']
     ring_search_cfg = config['ring_search']
+    validation_cfg = config['board_validation']
     
-    # Detect outer board circle
+    # OPTIMIZATION: Do ALL Hough transforms upfront
     min_radius = int(min(h, w) * board_cfg['min_circle_ratio'])
     max_radius = int(min(h, w) * board_cfg['max_circle_ratio'])
-    radii = np.arange(min_radius, max_radius, board_cfg['radius_step'])
     
-    hough_res = transform.hough_circle(edges, radii)
-    accums, cx, cy, radii_detected = transform.hough_circle_peaks(hough_res, radii, total_num_peaks=1)
+    # Search all radii from 5% to max_radius in one shot
+    # Use step_size from config (calculated dynamically based on image dimensions)
+    min_inner = int(min_radius * 0.05)
+    all_radii = np.arange(min_inner, max_radius, ring_search_cfg['step_size'])
+    
+    print(f"Running single Hough transform for {len(all_radii)} radii (step_size={ring_search_cfg['step_size']})...")
+    hough_res = transform.hough_circle(edges, all_radii)
+    accums, cx, cy, radii_detected = transform.hough_circle_peaks(hough_res, all_radii, total_num_peaks=100)
     
     if len(cx) == 0:
+        print("No circles found")
         return None
     
-    board_center = (int(cx[0]), int(cy[0]))
-    board_radius = int(radii_detected[0])
+    print(f"Found {len(cx)} circle candidates, filtering...")
     
-    # Detect inner rings
-    min_search_r = int(board_radius * 0.05)
-    max_search_r = int(board_radius * 0.98)
-    search_radii = np.arange(min_search_r, max_search_r, ring_search_cfg['step_size'])
+    # Build lookup of all detected circles
+    all_circles = []
+    for x, y, r, acc in zip(cx, cy, radii_detected, accums):
+        all_circles.append({
+            'center': (int(x), int(y)),
+            'radius': int(r),
+            'acc': float(acc)
+        })
     
-    hough_res = transform.hough_circle(edges, search_radii)
-    accums, cx, cy, radii_det = transform.hough_circle_peaks(hough_res, search_radii, total_num_peaks=30)
+    # Get ring_5 candidates (should be around 95% of outer, so large radii)
+    # ring_5 is the PRIMARY REFERENCE ring, outer board edge is calculated
+    ring5_min = int(min_radius * 0.95)  # Approximate minimum for ring_5
+    ring5_candidates = [c for c in all_circles if c['radius'] >= ring5_min]
+    ring5_candidates.sort(key=lambda x: x['radius'], reverse=True)
     
-    # Filter candidates near board center
-    max_offset = board_radius * ring_search_cfg['max_center_offset']
-    candidates = []
-    for x, y, r, acc in zip(cx, cy, radii_det, accums):
-        dist = np.hypot(x - board_center[0], y - board_center[1])
-        if dist < max_offset:
-            candidates.append({
-                'radius': r,
-                'center': (x, y),
-                'accumulator': acc
-            })
-    
-    candidates.sort(key=lambda x: x['radius'])
-    
-    detected_rings = {'outer': board_radius}
-    used_candidates = set()
-    
-    # Match candidates to expected ring ratios
-    inner_ratios = {k: v for k, v in ring_ratios.items() if k != 'outer'}
-    sorted_rings = sorted(inner_ratios.items(), key=lambda x: x[1], reverse=True)
-    
-    for ring_name, ratio in sorted_rings:
-        expected_r = int(board_radius * ratio)
-        tol = expected_r * ring_search_cfg['tolerance']
+    # Try pattern matching using each ring_5 candidate as reference
+    for ring5_candidate in ring5_candidates:
+        ring5_center = ring5_candidate['center']
+        ring5_radius = ring5_candidate['radius']
         
-        best_match = None
-        best_diff = float('inf')
-        best_idx = None
-        for idx, c in enumerate(candidates):
-            if idx in used_candidates:
-                continue
-            diff = abs(c['radius'] - expected_r)
-            if diff < tol and diff < best_diff:
-                best_diff = diff
-                best_match = c
-                best_idx = idx
+        # Calculate what the outer board radius should be (NOT detected)
+        board_radius = int(ring5_radius / ring_ratios['ring_5'])
+        board_center = ring5_center
         
-        if best_match is not None:
-            detected_rings[ring_name] = best_match['radius']
-            used_candidates.add(best_idx)
+        # Only store detected rings (ring_5 + 3 inner)
+        detected_rings = {
+            'ring_5': ring5_radius
+        }
+        max_offset = board_radius * ring_search_cfg['max_center_offset']
+        
+        # Match remaining 3 inner rings (ring_15, ring_10, center)
+        inner_ratios = {k: v for k, v in ring_ratios.items() if k != 'ring_5'}
+        sorted_rings = sorted(inner_ratios.items(), key=lambda x: x[1], reverse=True)
+        
+        for ring_name, ratio in sorted_rings:
+            expected_r = int(board_radius * ratio)
+            tol = int(expected_r * ring_search_cfg['tolerance'])
+            
+            # Find best matching circle from pre-computed results
+            best_match = None
+            best_diff = float('inf')
+            
+            for circle in all_circles:
+                # Check radius match
+                if abs(circle['radius'] - expected_r) > tol:
+                    continue
+                
+                # Check center proximity
+                dist = np.hypot(circle['center'][0] - board_center[0], 
+                               circle['center'][1] - board_center[1])
+                if dist > max_offset:
+                    continue
+                
+                # Track best match
+                diff = abs(circle['radius'] - expected_r)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_match = circle
+            
+            if best_match is not None:
+                detected_rings[ring_name] = expected_r  # Use exact expected radius
+            else:
+                break  # Pattern invalid
+        
+        # Check if we found all 4 rings (ring_5 + 3 inner: ring_15, ring_10, center)
+        if len(detected_rings) == 4:
+            # Calculate outer radius for scoring (not detected)
+            outer_radius = board_radius
+            print(f"Board found: center={board_center}, outer_radius={outer_radius} (calculated from ring_5={ring5_radius})")
+            print(f"  Detected 4 rings: {', '.join(detected_rings.keys())}")
+            return {
+                'center': board_center,
+                'radius': outer_radius,  # Calculated outer radius for scoring
+                'rings': detected_rings  # Only the 4 detected rings
+            }
     
-    # Always require at least an outer circle + *one* inner ring
-    if len(detected_rings) <= 1:
-        # Only outer ring found → probably not a board
-        return None
-
-    # Otherwise, return whatever rings we managed to detect.
-    # The caller (validation step) will decide if it's "good enough".
-    return {
-        'center': board_center,
-        'radius': board_radius,
-        'rings': detected_rings
-    }
+    print("No valid board pattern found")
+    return None
 
 
 def visualize_board_detection(img, board_result):
@@ -190,33 +250,20 @@ def visualize_board_detection(img, board_result):
     detected_rings = board_result['rings']
     
     colors = {
-        'outer':  [0, 255, 0],
-        'ring_15':[255, 255, 0],
-        'ring_10':[255, 165, 0],
         'ring_5': [255, 0, 0],
+        'ring_15': [255, 255, 0],
+        'ring_10': [255, 165, 0],
         'center': [0, 0, 255]
     }
     
-    # --- NEW: ensure overlay is 3-channel RGB ---
-    if img.ndim == 2:
-        # grayscale → stack to 3 channels
-        base = np.stack([img, img, img], axis=-1)
-    else:
-        if img.shape[-1] == 4:
-            # RGBA → drop alpha
-            base = img[..., :3]
-        else:
-            base = img
-    overlay = base.copy()
-    # -------------------------------------------
-    
     fig, ax = plt.subplots(1, figsize=(8, 8))
+    overlay = img.copy()
     
     for ring_name, ring_radius in detected_rings.items():
         if ring_name in colors:
             circy, circx = draw.circle_perimeter(
                 board_center[1], board_center[0], ring_radius,
-                shape=overlay.shape[:2]
+                shape=img.shape[:2]
             )
             overlay[circy, circx] = colors[ring_name]
     
@@ -228,134 +275,130 @@ def visualize_board_detection(img, board_result):
 
 
 
-def correct_perspective(img, board_result):
+def create_scoring_regions(img_shape, board_result):
     """
-    Correct perspective distortion by registering detected rings to perfect circles.
+    Create a segmentation mask with scoring regions based on detected rings.
     
-    The detected rings are actually ellipses due to perspective, but Hough circles
-    fit circles to them. We sample points from these detected "circles" (which follow
-    the elliptical edges) and map them to perfect circles at the same radii.
-    """
-    if board_result is None:
-        return None, None
+    Returns a mask where pixel values represent point values:
+    0 = outside board (beyond ring_5)
+    5 = between ring_5 and ring_15
+    10 = between ring_15 and ring_10
+    15 = between ring_10 and center
+    20 = inside center hole
     
-    detected_center = board_result['center']
-    detected_rings = board_result['rings']
-    
-    # Sample points around each detected ring
-    def sample_ring_points(center, radius, n_points=50):
-        angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
-        points = []
-        for angle in angles:
-            x = center[0] + radius * np.cos(angle)
-            y = center[1] + radius * np.sin(angle)
-            points.append([x, y])
-        return np.array(points)
-    
-    # Collect point correspondences from all rings
-    src_points = []  # Detected positions (elliptical in reality)
-    dst_points = []  # Target positions (perfect circles)
-    
-    for ring_name, radius in detected_rings.items():
-        # Source: sample points from detected ring (follows ellipse due to perspective)
-        ring_src = sample_ring_points(detected_center, radius, n_points=50)
-        src_points.append(ring_src)
-        
-        # Destination: same points but on perfect circle (orthogonal view)
-        ring_dst = sample_ring_points(detected_center, radius, n_points=50)
-        dst_points.append(ring_dst)
-    
-    # Combine all points from all rings
-    src_points = np.vstack(src_points)
-    dst_points = np.vstack(dst_points)
-    
-    # Compute projective transformation (homography)
-    # This maps the elliptical rings → circular rings
-    tform = transform.ProjectiveTransform()
-    tform.estimate(src_points, dst_points)
-    
-    # Analyze transformation magnitude
-    # Compare identity matrix to actual transformation
-    identity = np.eye(3)
-    diff = np.linalg.norm(tform.params - identity)
-    
-    # Check for perspective distortion (non-zero off-diagonal elements in last row)
-    perspective_strength = np.linalg.norm(tform.params[2, :2])
-    
-    transform_info = {
-        'applied': diff > 0.01,  # Significant transformation applied
-        'magnitude': diff,
-        'perspective_strength': perspective_strength,
-        'matrix': tform.params
-    }
-    
-    # Warp the image to correct perspective
-    straightened = transform.warp(img, tform.inverse, output_shape=img.shape)
-    
-    # Convert back to uint8 for display
-    straightened = (straightened * 255).astype(np.uint8)
-    
-    return straightened, transform_info
-
-
-def create_scoring_regions(img_shape, board_result, config):
-    """
-    Create scoring mask (0,5,10,15,20) using detected rings
-    plus ratio-based fallbacks from `config`.
-    Radial order (outer → center): outer > ring_5 > ring_10 > ring_15 > center.
+    Note: Uses board_result['radius'] as the calculated board boundary from ring_5.
     """
     if board_result is None:
         return None
-
+    
     h, w = img_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
-
-    board_center   = board_result['center']
+    
+    board_center = board_result['center']
+    board_radius = board_result['radius']  # Calculated from ring_5
     detected_rings = board_result['rings']
-    ring_ratios    = config.get('ring_ratios', {})
-
-    # --- robust radii with fallback to CONFIG ratios ------------------------
-    outer_r = detected_rings.get('outer', None)
-    if outer_r is None:
-        return None
-
-    ring_5_r  = _ring_radius_with_fallback(detected_rings, 'ring_5',  outer_r, ring_ratios)
-    ring_10_r = _ring_radius_with_fallback(detected_rings, 'ring_10', outer_r, ring_ratios)
-    ring_15_r = _ring_radius_with_fallback(detected_rings, 'ring_15', outer_r, ring_ratios)
-    center_r  = _ring_radius_with_fallback(detected_rings, 'center',  outer_r, ring_ratios)
-
-    # enforce monotone ordering: ring_5 > ring_10 > ring_15 > center
-    radii = [r for r in [ring_5_r, ring_10_r, ring_15_r, center_r] if r is not None]
-    if len(radii) >= 2:
-        radii_sorted = sorted(radii, reverse=True)  # biggest → smallest
-        i = 0
-        if ring_5_r  is not None: ring_5_r  = radii_sorted[i]; i += 1
-        if ring_10_r is not None: ring_10_r = radii_sorted[i]; i += 1
-        if ring_15_r is not None: ring_15_r = radii_sorted[i]; i += 1
-        if center_r  is not None and i < len(radii_sorted):
-            center_r = radii_sorted[i]
-
-    # -----------------------------------------------------------------------
+    
+    # Create coordinate grid
     y, x = np.ogrid[:h, :w]
     distances = np.sqrt((x - board_center[0])**2 + (y - board_center[1])**2)
-
-    # 5 pt: between ring_5 and ring_10
-    if ring_5_r is not None and ring_10_r is not None:
-        mask[(distances <= ring_5_r) & (distances > ring_10_r)] = 5
-
-    # 10 pt: between ring_10 and ring_15
-    if ring_10_r is not None and ring_15_r is not None:
-        mask[(distances <= ring_10_r) & (distances > ring_15_r)] = 10
-
-    # 15 pt: between ring_15 and center
-    if ring_15_r is not None and center_r is not None:
-        mask[(distances <= ring_15_r) & (distances > center_r)] = 15
-
-    # 20 pt: inside center hole
+    
+    # Get ring radii from detected rings
+    ring_5_r = detected_rings.get('ring_5', None)
+    ring_15_r = detected_rings.get('ring_15', None)
+    ring_10_r = detected_rings.get('ring_10', None)
+    center_r = detected_rings.get('center', None)
+    
+    # Everything starts at 0 (outside board)
+    # Assign scoring values to the spaces BETWEEN rings
+    
+    # 5 point region: between ring_5 and ring_15
+    if ring_5_r is not None and ring_15_r is not None:
+        mask[(distances <= ring_5_r) & (distances > ring_15_r)] = 5
+    
+    # 10 point region: between ring_15 and ring_10
+    if ring_15_r is not None and ring_10_r is not None:
+        mask[(distances <= ring_15_r) & (distances > ring_10_r)] = 10
+    
+    # 15 point region: between ring_10 and center
+    if ring_10_r is not None and center_r is not None:
+        mask[(distances <= ring_10_r) & (distances > center_r)] = 15
+    
+    # 20 point region: inside center hole
     if center_r is not None:
         mask[distances <= center_r] = 20
-
+    
     return mask
+
+
+def visualize_scoring_regions(img, scoring_mask):
+    """
+    Visualize the scoring regions with colored overlay.
+    Each scoring region gets a distinct color.
+    """
+    if scoring_mask is None:
+        print("No scoring mask to visualize")
+        return
+    
+    # Define colors for each scoring region (RGB)
+    region_colors = {
+        0: [50, 50, 50],      # Outside - dark gray
+        5: [100, 200, 100],   # Outer ring (5pt) - light green
+        10: [255, 200, 100],  # Middle ring (10pt) - orange
+        15: [255, 255, 100],  # Inner ring (15pt) - yellow
+        20: [255, 100, 100]   # Center (20pt) - red
+    }
+    
+    # Create colored overlay
+    overlay = np.zeros((*scoring_mask.shape, 3), dtype=np.uint8)
+    for score_value, rgb_color in region_colors.items():
+        mask_region = scoring_mask == score_value
+        overlay[mask_region] = rgb_color
+    
+    # Blend with original image
+    alpha = 0.5
+    if len(img.shape) == 3:
+        blended = (alpha * img + (1 - alpha) * overlay).astype(np.uint8)
+    else:
+        img_rgb = np.stack([img, img, img], axis=2)
+        blended = (alpha * img_rgb + (1 - alpha) * overlay).astype(np.uint8)
+    
+    # Display
+    _, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    axes[0].imshow(img)
+    axes[0].set_title("Original Image")
+    axes[0].axis('off')
+    
+    axes[1].imshow(overlay)
+    axes[1].set_title("Scoring Regions Mask")
+    axes[1].axis('off')
+    
+    axes[2].imshow(blended)
+    axes[2].set_title("Blended Overlay")
+    axes[2].axis('off')
+    
+    # Add legend
+    unique_scores = np.unique(scoring_mask)
+    legend_text = "Scoring Regions:\n"
+    for score in sorted(unique_scores):
+        if score == 0:
+            legend_text += f"  {score}pt: Outside board\n"
+        elif score == 20:
+            legend_text += f"  {score}pt: Center hole\n"
+        else:
+            legend_text += f"  {score}pt: Ring\n"
+    
+    plt.figtext(0.5, 0.02, legend_text, ha='center', fontsize=10, 
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"Scoring regions: {sorted(unique_scores)} points")
+    for score in sorted(unique_scores):
+        count = np.sum(scoring_mask == score)
+        percentage = (count / scoring_mask.size) * 100
+        print(f"  {score}pt region: {count} pixels ({percentage:.1f}%)")
 
 def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
     """
@@ -373,87 +416,6 @@ def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
     return float(vals.std()), float(vals.mean())
 
 
-
-def visualize_scoring_regions(img, scoring_mask):
-    """
-    Visualize the scoring regions with colored overlay.
-    Each scoring region gets a distinct color.
-    """
-    if scoring_mask is None:
-        print("No scoring mask to visualize")
-        return
-
-    # ---------- NEW: normalize img to RGB (H,W,3) ----------
-    if img.ndim == 2:
-        # grayscale -> stack
-        base = np.stack([img, img, img], axis=-1)
-    else:
-        if img.shape[-1] == 4:
-            # RGBA -> drop alpha
-            base = img[..., :3]
-        else:
-            base = img
-    # make sure it's uint8 for display
-    if base.dtype != np.uint8:
-        base = (np.clip(base, 0, 1) * 255).astype(np.uint8)
-    # -------------------------------------------------------
-
-    # Define colors for each scoring region (RGB)
-    region_colors = {
-        0: [50, 50, 50],      # Outside - dark gray
-        5: [100, 200, 100],   # Outer ring (5pt) - light green
-        10: [255, 200, 100],  # Middle ring (10pt) - orange
-        15: [255, 255, 100],  # Inner ring (15pt) - yellow
-        20: [255, 100, 100]   # Center (20pt) - red
-    }
-
-    # Create colored overlay
-    overlay = np.zeros((*scoring_mask.shape, 3), dtype=np.uint8)
-    for score_value, rgb_color in region_colors.items():
-        mask_region = scoring_mask == score_value
-        overlay[mask_region] = rgb_color
-
-    # Blend with original image (now base is H×W×3)
-    alpha = 0.5
-    blended = (alpha * base + (1 - alpha) * overlay).astype(np.uint8)
-
-    # Display
-    _, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    axes[0].imshow(base)
-    axes[0].set_title("Original Image")
-    axes[0].axis('off')
-
-    axes[1].imshow(overlay)
-    axes[1].set_title("Scoring Regions Mask")
-    axes[1].axis('off')
-
-    axes[2].imshow(blended)
-    axes[2].set_title("Blended Overlay")
-    axes[2].axis('off')
-
-    # Legend + stats (unchanged)
-    unique_scores = np.unique(scoring_mask)
-    legend_text = "Scoring Regions:\n"
-    for score in sorted(unique_scores):
-        if score == 0:
-            legend_text += f"  {score}pt: Outside board\n"
-        elif score == 20:
-            legend_text += f"  {score}pt: Center hole\n"
-        else:
-            legend_text += f"  {score}pt: Ring\n"
-
-    plt.figtext(0.5, 0.02, legend_text, ha='center', fontsize=10,
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-    plt.tight_layout()
-    plt.show()
-
-    print(f"Scoring regions: {sorted(unique_scores)} points")
-    for score in sorted(unique_scores):
-        count = np.sum(scoring_mask == score)
-        percentage = (count / scoring_mask.size) * 100
-        print(f"  {score}pt region: {count} pixels ({percentage:.1f}%)")
 
 # -----------------------------
 # STEP 5: Disc detection + colour grouping
@@ -479,24 +441,34 @@ def _expected_disc_radius(board_result, config, pad_frac=0.10, min_px=4):
     band = max(min_px, r0 * pad_frac)
     return r0, max(2, int(r0 - band)), int(r0 + band)
 
+def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
+    """
+    Sample grayscale values on a mid-radius circle (frac * r) around (x,y).
+    Returns (std, mean). Real discs should have low std (nearly uniform colour).
+    """
+    h, w = lum.shape
+    if r <= 2:
+        return 0.0, 0.0
+    radius = max(2.0, frac * float(r))
+    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+    xs = np.clip((x + radius * np.cos(angles)).round().astype(int), 0, w-1)
+    ys = np.clip((y + radius * np.sin(angles)).round().astype(int), 0, h-1)
+    vals = lum[ys, xs]
+    return float(vals.std()), float(vals.mean())
+
 
 
 def _play_area_mask(shape, board_result, inset_px=4):
     """
-    Inside the playable wood (<= ring_5). If ring_5 is missing, use 0.95*outer.
+    Inside the playable wood (<= ring_5).
     """
     h, w = shape[:2]
     yy, xx = np.mgrid[0:h, 0:w]
     cx, cy = board_result['center']
     rings = board_result['rings']
-    rout = float(rings.get('outer', 0.0))
-    r5   = float(rings.get('ring_5', 0.95 * rout if rout > 0 else 0.0))
+    r5 = float(rings.get('ring_5', 0.0))
 
-    r_play_outer = r5 if r5 > 0 else rout
-    if rout > 0 and r5 > 0:
-        r_play_outer = min(r5, rout)
-
-    r_play_outer = max(0.0, r_play_outer - inset_px)
+    r_play_outer = max(0.0, r5 - inset_px) if r5 > 0 else 0.0
     dist = np.hypot(xx - cx, yy - cy)
     return dist <= r_play_outer
 
@@ -1152,7 +1124,7 @@ def calculate_disc_scores(discs, mask, line_band, board_info):
     h, w = mask.shape
     cx, cy = board_info['center']
     r_center = board_info['radii']['center']
-    r_outer = board_info['radii']['outer']
+    r_ring5 = board_info['radii']['ring_5']  # Use ring_5 as playable boundary
 
     for i, d in enumerate(discs):
         x, y = d['center']
@@ -1199,7 +1171,7 @@ def calculate_disc_scores(discs, mask, line_band, board_info):
             flags.append('line_touch')
 
         # sanity checks
-        if (center_dist + r) > (r_outer + 1):
+        if (center_dist + r) > (r_ring5 + 1):  # Outside ring_5 (playable boundary)
             base_score = 0
             flags.append('outside')
 
