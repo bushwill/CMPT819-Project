@@ -11,6 +11,54 @@ from dataclasses import dataclass
 import warnings
 
 
+def preprocess_image(img, target_size=None, max_dimension=1200):
+    """
+    Preprocess image for optimal processing:
+    - Resize if too large (to improve performance)
+    - Ensure proper formatting (RGB, uint8)
+    - Normalize dimensions for consistent processing
+    
+    Args:
+        img: Input image (any format)
+        target_size: Tuple (height, width) for exact resizing, or None for auto
+        max_dimension: Maximum dimension (height or width) if target_size is None
+    
+    Returns:
+        Preprocessed image (RGB, uint8, appropriate dimensions)
+    """
+    # Convert to RGB if grayscale or RGBA
+    if len(img.shape) == 2:
+        img = color.gray2rgb(img)
+    elif img.shape[2] == 4:
+        img = color.rgba2rgb(img)
+    
+    # Ensure uint8 format
+    if img.dtype != np.uint8:
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+    
+    # Resize if needed
+    h, w = img.shape[:2]
+    
+    if target_size is not None:
+        # Exact size specified
+        if (h, w) != target_size:
+            img = transform.resize(img, target_size, anti_aliasing=True, preserve_range=True).astype(np.uint8)
+            print(f"Image resized to exact dimensions: {target_size}")
+    elif max(h, w) > max_dimension:
+        # Auto-resize to max_dimension while preserving aspect ratio
+        scale = max_dimension / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        img = transform.resize(img, (new_h, new_w), anti_aliasing=True, preserve_range=True).astype(np.uint8)
+        print(f"Image resized from ({h}, {w}) to ({new_h}, {new_w}) for optimal processing")
+    else:
+        print(f"Image dimensions ({h}, {w}) are within acceptable range")
+    
+    return img
+
+
 def display_image(img, title="Image", figsize=(8, 8)):
     """Display a single image with optional title."""
     plt.figure(figsize=figsize)
