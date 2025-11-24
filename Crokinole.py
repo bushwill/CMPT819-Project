@@ -8,7 +8,88 @@ import matplotlib.pyplot as plt
 from skimage import color, feature, transform, draw, filters, measure, morphology, exposure
 from matplotlib import patches
 from dataclasses import dataclass
-import warnings
+
+def preprocess_image(img, target_size=None, max_dimension=1200):
+    """
+    Preprocess image for optimal processing:
+    - Resize if too large (to improve performance)
+    - Ensure proper formatting (RGB, uint8)
+    - Normalize dimensions for consistent processing
+    
+    Args:
+        img: Input image (any format)
+        target_size: Tuple (height, width) for exact resizing, or None for auto
+        max_dimension: Maximum dimension (height or width) if target_size is None
+    
+    Returns:
+        Preprocessed image (RGB, uint8, appropriate dimensions)
+    """
+    # Convert to RGB if grayscale or RGBA
+    if len(img.shape) == 2:
+        img = color.gray2rgb(img)
+    elif img.shape[2] == 4:
+        img = color.rgba2rgb(img)
+    
+    # Ensure uint8 format
+    if img.dtype != np.uint8:
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+    
+    # Resize if needed
+    h, w = img.shape[:2]
+    
+    if target_size is not None:
+        # Exact size specified
+        if (h, w) != target_size:
+            img = transform.resize(img, target_size, anti_aliasing=True, preserve_range=True).astype(np.uint8)
+            print(f"Image resized to exact dimensions: {target_size}")
+    elif max(h, w) > max_dimension:
+        # Auto-resize to max_dimension while preserving aspect ratio
+        scale = max_dimension / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        img = transform.resize(img, (new_h, new_w), anti_aliasing=True, preserve_range=True).astype(np.uint8)
+        print(f"Image resized from ({h}, {w}) to ({new_h}, {new_w}) for optimal processing")
+    else:
+        print(f"Image dimensions ({h}, {w}) are within acceptable range")
+    
+    return img
+
+def balance_colors(image):
+    """
+    Apply color balancing using histogram equalization per channel.
+    This spreads out color values to make input more consistent across different lighting conditions.
+    
+    Uses adaptive histogram equalization (CLAHE) for better local contrast while
+    maintaining global color balance.
+    
+    Args:
+        image: Input RGB image (uint8)
+    
+    Returns:
+        Color-balanced image (uint8)
+    """
+    # Convert to float [0, 1] for processing
+    img_float = image.astype(float) / 255.0
+    
+    # Convert to LAB color space (better for color processing than RGB)
+    img_lab = color.rgb2lab(img_float)
+    
+    # Apply adaptive histogram equalization to L channel (luminance)
+    # This preserves colors while balancing brightness
+    img_lab[:, :, 0] = exposure.equalize_adapthist(
+        img_lab[:, :, 0] / 100.0,  # Normalize L channel to [0, 1]
+        clip_limit=0.03  # Limit contrast enhancement to avoid over-processing
+    ) * 100.0  # Scale back to LAB range
+    
+    # Convert back to RGB
+    img_balanced = color.lab2rgb(img_lab)
+    
+    # Convert back to uint8
+    img_balanced = (np.clip(img_balanced, 0, 1) * 255).astype(np.uint8)
+    
+    return img_balanced
 
 
 def display_image(img, title="Image", figsize=(8, 8)):
@@ -319,21 +400,62 @@ def visualize_scoring_regions(img, scoring_mask):
         percentage = (count / scoring_mask.size) * 100
         print(f"  {score}pt region: {count} pixels ({percentage:.1f}%)")
 
+def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
+    """
+    Sample grayscale values on a mid-radius circle (frac * r) around (x,y).
+    Returns (std, mean). Real discs should have low std (nearly uniform colour).
+    """
+    h, w = lum.shape
+    if r <= 2:
+        return 0.0, 0.0
+    radius = max(2.0, frac * float(r))
+    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+    xs = np.clip((x + radius * np.cos(angles)).round().astype(int), 0, w-1)
+    ys = np.clip((y + radius * np.sin(angles)).round().astype(int), 0, h-1)
+    vals = lum[ys, xs]
+    return float(vals.std()), float(vals.mean())
+
+
+
 # -----------------------------
 # STEP 5: Disc detection + colour grouping
 # -----------------------------
 
-def _expected_disc_radius(board_result, pad_frac=0.10, min_px=4):
+def _expected_disc_radius(board_result, config, pad_frac=0.10, min_px=4):
     """
-    Use the 20-hole radius as the expected disc radius.
-    'pad_frac' widens the allowed band by ±(pad_frac * r0).
+    Use the 'center' ring if present; otherwise approximate it from outer radius
+    and CONFIG['ring_ratios']['center'].
     """
     rings = board_result['rings']
-    r0 = float(rings.get('center', 0.0))   # 20-hole radius
-    if r0 <= 0:
+    r0 = float(rings.get('center', 0.0))
+
+    if r0 <= 0.0:
+        outer_r = float(rings.get('outer', 0.0))
+        if outer_r > 0:
+            center_ratio = config.get('ring_ratios', {}).get('center', 0.05)
+            r0 = outer_r * center_ratio
+
+    if r0 <= 0.0:
         return None, None, None
+
     band = max(min_px, r0 * pad_frac)
     return r0, max(2, int(r0 - band)), int(r0 + band)
+
+def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
+    """
+    Sample grayscale values on a mid-radius circle (frac * r) around (x,y).
+    Returns (std, mean). Real discs should have low std (nearly uniform colour).
+    """
+    h, w = lum.shape
+    if r <= 2:
+        return 0.0, 0.0
+    radius = max(2.0, frac * float(r))
+    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+    xs = np.clip((x + radius * np.cos(angles)).round().astype(int), 0, w-1)
+    ys = np.clip((y + radius * np.sin(angles)).round().astype(int), 0, h-1)
+    vals = lum[ys, xs]
+    return float(vals.std()), float(vals.mean())
+
 
 
 def _play_area_mask(shape, board_result, inset_px=4):
@@ -386,29 +508,60 @@ def _lab_patch_mean(lab_img, x, y, half=3):
 
 def _kmeans2_lab(feats, seed=0):
     """
-    Tiny K=2 k-means on Lab features; returns labels (0/1) and centroids.
+    Robust K=2 k-means on Lab features.
+    Handles edge cases: 0 discs, 1 disc, or all discs identical color.
     """
+    # Case 0: No discs
     if len(feats) == 0:
         return np.array([], dtype=int), np.zeros((2, 3))
+
     X = np.asarray(feats, float)
+    
+    # Case 1: Only one disc found
+    # We cannot cluster 1 point into 2 groups. Assign it to group 0.
+    if len(X) == 1:
+        # Return label [0] and duplicate centroids
+        return np.array([0], dtype=int), np.stack([X[0], X[0]])
+
     rng = np.random.default_rng(seed)
 
-    # k-means++ init
-    c0 = X[rng.integers(0, len(X))]
+    # --- K-Means++ Initialization (Safe Mode) ---
+    # 1. Pick first centroid randomly
+    idx0 = rng.integers(0, len(X))
+    c0 = X[idx0]
+
+    # 2. Pick second centroid based on distance
     d2 = np.sum((X - c0) ** 2, axis=1)
-    probs = d2 / (d2.sum() + 1e-9)
-    c1 = X[rng.choice(len(X), p=probs)]
+    total_dist = d2.sum()
+
+    # SAFETY CHECK: If all discs are identical color (total_dist is 0),
+    # we can't divide by zero. Just pick a random second point.
+    if total_dist < 1e-9:
+        idx1 = rng.integers(0, len(X))
+    else:
+        # Normalize probabilities strictly to sum to 1.0
+        probs = d2 / total_dist
+        probs = probs / probs.sum() # Double normalization fixes floating point drift
+        idx1 = rng.choice(len(X), p=probs)
+
+    c1 = X[idx1]
     C = np.stack([c0, c1], axis=0)
 
+    # --- Lloyd's Algorithm (Standard) ---
     for _ in range(20):
-        D = ((X[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
-        L = np.argmin(D, axis=1)
+        # Assign points to nearest centroid
+        d = ((X[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
+        L = np.argmin(d, axis=1)
+        
         C_new = []
+        # Update centroids
         for k in (0, 1):
             if np.any(L == k):
                 C_new.append(X[L == k].mean(axis=0))
             else:
+                # If a cluster became empty, keep old centroid
                 C_new.append(C[k])
+        
         C_new = np.stack(C_new, axis=0)
         if np.allclose(C_new, C, atol=1e-4):
             break
@@ -416,75 +569,356 @@ def _kmeans2_lab(feats, seed=0):
 
     return L.astype(int), C
 
+from skimage import measure, morphology
 
-def detect_discs(straightened_img, board_result, config):
+from skimage import morphology, measure, color, exposure, filters, feature
+import numpy as np
+
+from skimage import color, exposure, filters, feature, morphology, measure
+
+
+# ---------------------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------------------
+def detect_discs(straightened_img, board_result, config, debug_stats=False):
     """
-    Disc detection tied to the 20-hole size + immediate colour grouping.
+    Best-of-both-worlds disc detection.
 
-    Returns a list of dicts:
-        {
-          'center': (x, y),
-          'radius': r,      # snapped to 20-hole radius
-          'score': edge_strength,
-          'team':  0 or 1,  # colour cluster
-          'lab':   (L, a, b)
-        }
+    - WOOD boards: segmentation-based:
+        * Dark branch: Strong DARK_DELTA + local annulus contrast (working well).
+        * Light branch: **REVISED** Lower LIGHT_DELTA + **NEW local annulus contrast**
+          (fixes missing light discs and kills light ghosts).
     """
     h, w = straightened_img.shape[:2]
-    r0, r_min, r_max = _expected_disc_radius(board_result, pad_frac=0.10)  # ±10%
+
+    # ---------- basic geometry ----------
+    r0, r_min, r_max = _expected_disc_radius(board_result, config, pad_frac=0.50)
     if r0 is None:
         print("[DD] No center ring radius; cannot infer disc size.")
         return []
 
+    cx_board, cy_board = board_result['center']
+    rings = board_result['rings']
+
+    # 20-hole radius (fallback if missing)
+    r_center = float(rings.get('center', 0.0))
+    if r_center <= 0.0:
+        r_outer = float(rings.get('outer', min(h, w) / 2.0))
+        r_center = 0.06 * r_outer
+
     cfg = config.get('disc_detection', {})
     max_discs = cfg.get('max_discs', 28)
 
-    # --- Pre-processing -------------------------------------------------------
+    # ---------- board type ----------
+    raw_gray = color.rgb2gray(straightened_img.astype(float) / 255.0)
+    board_med_raw = float(np.median(raw_gray))
+    is_wood = board_med_raw < 0.65
+    print(f"[DD] Board median={board_med_raw:.3f} → {'WOOD' if is_wood else 'WHITE'} mode")
+
+    # ---------- playable mask ----------
+    play_mask = _play_area_mask(
+        straightened_img.shape,
+        board_result,
+        inset_px=max(3, int(0.003 * min(h, w)))
+    )
+
+    # ---------- white-board path ----------
+    if not is_wood:
+        return _detect_discs_hough_white(
+            straightened_img, board_result, config,
+            play_mask, r0, r_min, r_max, r_center, max_discs, debug_stats
+        )
+
+    # -----------------------------------------------------------------
+    # WOOD BOARD PATH  (best of both worlds)
+    # -----------------------------------------------------------------
     img_f = straightened_img.astype(float) / 255.0
     sharp = filters.unsharp_mask(img_f, radius=2, amount=1.5)
     lum   = color.rgb2gray(sharp)
     lum   = exposure.equalize_adapthist(lum, clip_limit=0.01)
 
-    med = float(np.median(lum))
-    low_t, high_t = max(0.05, 0.66 * med), min(0.98, 1.33 * med)
+    board_med = float(np.median(lum[play_mask]))  # use only playable area
+
+    disc_area = np.pi * (r0 ** 2)
+    AREA_MIN  = 0.35 * disc_area
+    AREA_MAX  = 1.80 * disc_area
+    CIRC_MIN  = 0.60
+
+    # thresholds
+    DARK_DELTA   = 0.20   # very dark → black discs
+    # LIGHT_DELTA adjusted from 0.03 to 0.01 to catch subtle light discs
+    LIGHT_DELTA  = 0.005   
+    LOCAL_DELTA_D = 0.10  # local contrast for dark discs
+    # NEW: local contrast threshold for light discs to kill glare ghosts
+    LOCAL_DELTA_L = 0.05 
+
+    # --- raw masks ---
+    dark_raw  = (lum < board_med - DARK_DELTA) & play_mask
+    light_raw = (lum > board_med + LIGHT_DELTA) & play_mask
+
+    # --- morphology ---
+    se = morphology.disk(max(2, int(0.35 * r0)))
+    dark_mask  = morphology.binary_closing(
+                    morphology.binary_opening(dark_raw,  se), se
+                 )
+    light_mask = morphology.binary_closing(
+                    morphology.binary_opening(light_raw, se), se
+                 )
+
+    # we’ll use union for annulus exclusion later
+    disc_mask_union = dark_mask | light_mask
+
+    # convenience grid for annulus computation
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    # -------------------------------------------------------------
+    # helper: extract dark discs → uses LOCAL annulus contrast
+    # -------------------------------------------------------------
+    def extract_dark_regions():
+        labels = measure.label(dark_mask)
+        regions = measure.regionprops(labels, intensity_image=lum)
+        out = []
+        if debug_stats:
+            print(f"[DD-dark] regions: {len(regions)}")
+
+        for reg in regions:
+            area = reg.area
+            if area < AREA_MIN or area > AREA_MAX:
+                continue
+
+            per = reg.perimeter if reg.perimeter > 0 else 1.0
+            circ = 4.0 * np.pi * area / (per * per)
+            if circ < CIRC_MIN:
+                continue
+
+            cy, cx = reg.centroid
+            cx = float(cx); cy = float(cy)
+            r_est = 0.5 * reg.equivalent_diameter
+
+            # avoid 20 hole
+            d_center = np.hypot(cx - cx_board, cy - cy_board)
+            if d_center < (r_center + 0.4 * r0):
+                continue
+
+            # local-annulus background
+            dist = np.hypot(xx - cx, yy - cy)
+            annulus = (
+                (dist >= 1.3 * r_est) &
+                (dist <= 2.2 * r_est) &
+                play_mask &
+                (~disc_mask_union)
+            )
+            bg_vals = lum[annulus]
+            if bg_vals.size < 40:
+                bg_med = board_med
+            else:
+                bg_med = float(np.median(bg_vals))
+
+            # Check if disc is significantly different from local background
+            diff_local = abs(reg.mean_intensity - bg_med)
+            if diff_local < LOCAL_DELTA_D:
+                continue
+
+            if debug_stats:
+                print(
+                    f"[DD-dark-reg] ({int(cx):4d},{int(cy):4d}) "
+                    f"area={area:5.0f} circ={circ:.3f} "
+                    f"R~{r_est:4.1f} mean={reg.mean_intensity:.3f} "
+                    f"bg={bg_med:.3f} dLoc={diff_local:.3f}"
+                )
+
+            out.append((cx, cy, r_est))
+
+        return out
+
+    # -------------------------------------------------------------
+    # helper: extract light discs → REVISED with local contrast
+    # -------------------------------------------------------------
+    def extract_light_regions():
+        labels = measure.label(light_mask)
+        regions = measure.regionprops(labels, intensity_image=lum)
+        out = []
+        if debug_stats:
+            print(f"[DD-light] regions: {len(regions)}")
+
+        for reg in regions:
+            area = reg.area
+            if area < AREA_MIN or area > AREA_MAX:
+                continue
+
+            per = reg.perimeter if reg.perimeter > 0 else 1.0
+            circ = 4.0 * np.pi * area / (per * per)
+            if circ < CIRC_MIN:
+                continue
+
+            cy, cx = reg.centroid
+            cx = float(cx); cy = float(cy)
+            r_est = 0.5 * reg.equivalent_diameter
+
+            d_center = np.hypot(cx - cx_board, cy - cy_board)
+            if d_center < (r_center + 0.4 * r0):
+                continue
+            
+            # NEW: Local Annulus Contrast Check
+            dist = np.hypot(xx - cx, yy - cy)
+            annulus = (
+                (dist >= 1.3 * r_est) &
+                (dist <= 2.2 * r_est) &
+                play_mask &
+                (~disc_mask_union)
+            )
+            bg_vals = lum[annulus]
+            if bg_vals.size < 40:
+                bg_med = board_med
+            else:
+                bg_med = float(np.median(bg_vals))
+
+            # Light disc must be sufficiently brighter than its local background
+            # Note: We check if mean > bg_med + threshold, since light discs are brighter
+            diff_local = reg.mean_intensity - bg_med
+            if diff_local < LOCAL_DELTA_L:
+                continue
+                
+            if debug_stats:
+                print(
+                    f"[DD-light-reg] ({int(cx):4d},{int(cy):4d}) "
+                    f"area={area:5.0f} circ={circ:.3f} R~{r_est:4.1f} "
+                    f"mean={reg.mean_intensity:.3f} bg={bg_med:.3f} "
+                    f"dLoc={diff_local:.3f}"
+                )
+
+            out.append((cx, cy, r_est))
+
+        return out
+
+    dark_cands  = extract_dark_regions()
+    light_cands = extract_light_regions()
+
+    all_cands = dark_cands + light_cands
+    if not all_cands:
+        print("[DD-wood] no regions survived filters.")
+        return []
+
+    # --- NMS on centres to merge duplicates from dark/light branches ---
+    merged = []
+    for x, y, r in all_cands:
+        keep = True
+        for X, Y, R in merged:
+            if np.hypot(x - X, y - Y) < 0.6 * max(r, R):
+                keep = False
+                break
+        if keep:
+            merged.append((x, y, r))
+
+    # --- colour clustering & output ---
+    lab_img = color.rgb2lab(straightened_img.astype(float) / 255.0)
+
+    feats = [
+        _lab_patch_mean(
+            lab_img,
+            int(round(x)),
+            int(round(y)),
+            half=min(6, max(3, int(0.5 * r0)))
+        )
+        for (x, y, r) in merged
+    ]
+    feats = np.asarray(feats, float)
+    team_labels, centroids = _kmeans2_lab(feats, seed=0)
+
+    r_use = int(round(r0))
+    results = []
+    for (x, y, r), labv, team in zip(merged, feats, team_labels):
+        results.append({
+            "center": (int(round(x)), int(round(y))),
+            "radius": r_use,
+            "score":  1.0,
+            "team":   int(team),
+            "lab":    labv,
+        })
+
+    if cfg.get("debug_show_discs", True):
+        debug_show_discs(straightened_img, results, board_result)
+
+    return results[:max_discs]
+# The _detect_discs_hough_white function is assumed to remain unchanged as it is not the focus of the current issue.
+# ---------------------------------------------------------------------
+# White-board Hough path (same as before)
+# ---------------------------------------------------------------------
+def _detect_discs_hough_white(straightened_img, board_result, config,
+                              play_mask, r0, r_min, r_max,
+                              r_center, max_discs, debug_stats):
+    h, w = straightened_img.shape[:2]
+    cx_board, cy_board = board_result['center']
+    rings = board_result['rings']
+    ring_radii = [float(r) for name, r in rings.items() if name != 'outer']
+
+    THR_EDGE      = 0.06
+    THR_SD_IN     = 0.20
+    THR_CONTRAST  = 0.04
+    THR_DELTA_BRD = 0.035
+    THR_MID_STD   = 0.18
+    C_LOW, C_HIGH = 0.05, 0.98
+
+    img_f = straightened_img.astype(float) / 255.0
+    sharp = filters.unsharp_mask(img_f, radius=2, amount=1.5)
+    lum   = color.rgb2gray(sharp)
+    lum   = exposure.equalize_adapthist(lum, clip_limit=0.01)
+    med_lum = float(np.median(lum))
 
     e1 = feature.canny(lum,        sigma=1.5,
-                       low_threshold=low_t, high_threshold=high_t)
+                       low_threshold=C_LOW, high_threshold=C_HIGH)
     e2 = feature.canny(1.0 - lum,  sigma=1.5,
-                       low_threshold=low_t, high_threshold=high_t)
+                       low_threshold=C_LOW, high_threshold=C_HIGH)
     edges = np.maximum(e1, e2)
 
-    # --- Restrict to playable wood -------------------------------------------
-    play_mask = _play_area_mask(straightened_img.shape,
-                                board_result,
-                                inset_px=max(3, int(0.003 * min(h, w))))
-
-    # --- Hough circles in tight radius band ----------------------------------
     radii = np.arange(max(2, r_min), max(3, r_max + 1), 1, dtype=int)
     hspaces = transform.hough_circle(edges, radii)
-    acc, cx, cy, rs = transform.hough_circle_peaks(
-        hspaces, radii, total_num_peaks=140
+    acc, xs, ys, rs = transform.hough_circle_peaks(
+        hspaces, radii, total_num_peaks=180
     )
 
     cands = []
-    for a, x, y, r in zip(acc, cx, cy, rs):
+    for a, x, y, r in zip(acc, xs, ys, rs):
         x = int(x); y = int(y); r = int(r)
         if not (0 <= x < w and 0 <= y < h and play_mask[y, x]):
             continue
 
+        d_center = np.hypot(x - cx_board, y - cy_board)
+        if d_center < (r_center + 0.5 * r0):
+            continue
+
+        near_ring = False
+        for rr in ring_radii:
+            if abs(d_center - rr) < 0.7 * r0:
+                near_ring = True
+                break
+        if near_ring:
+            continue
+
         e_hit = _edge_ring(edges, x, y, r, n=50)
         mu_in, sd_in, mu_out = _inside_stats(lum, x, y, r)
-        contrast = abs(mu_in - mu_out)
+        contrast    = abs(mu_in - mu_out)
+        delta_board = abs(mu_in - med_lum)
+        mid_std, _  = _angular_uniformity(lum, x, y, r, n=40, frac=0.5)
 
-        # basic photometric vetting (tuned for your board images)
-        if e_hit >= 0.06 and sd_in <= 0.20 and contrast >= 0.05:
+        if (e_hit      >= THR_EDGE and
+            sd_in      <= THR_SD_IN and
+            contrast   >= THR_CONTRAST and
+            delta_board >= THR_DELTA_BRD and
+            mid_std    <= THR_MID_STD):
+            if debug_stats:
+                print(
+                    f"[DD-white] ({x:4d},{y:4d}) r={r:2d} "
+                    f"e={e_hit:.3f} sd_in={sd_in:.3f} "
+                    f"contr={contrast:.3f} dB={delta_board:.3f} "
+                    f"mid_std={mid_std:.3f}"
+                )
             cands.append((x, y, r, float(e_hit)))
 
     if not cands:
-        print("[DD] No disc candidates after photometric checks.")
+        print("[DD-white] No disc candidates passed thresholds.")
         return []
 
-    # --- Non-max suppression on centres --------------------------------------
     cands.sort(key=lambda t: t[3], reverse=True)
     picked = []
     for x, y, r, s in cands:
@@ -497,10 +931,9 @@ def detect_discs(straightened_img, board_result, config):
             picked.append((x, y, r, s))
 
     if not picked:
-        print("[DD] All candidates suppressed by NMS.")
+        print("[DD-white] All candidates suppressed by NMS.")
         return []
 
-    # --- Colour features & two-cluster k-means -------------------------------
     lab_img = color.rgb2lab(straightened_img.astype(float) / 255.0)
     feats = [
         _lab_patch_mean(lab_img, x, y,
@@ -509,7 +942,6 @@ def detect_discs(straightened_img, board_result, config):
     ]
     team_labels, centroids = _kmeans2_lab(feats, seed=0)
 
-    # --- Build result list (radius snapped to r0) ----------------------------
     r_use = int(round(r0))
     results = []
     for (x, y, r, s), labv, team in zip(picked, feats, team_labels):
@@ -517,16 +949,15 @@ def detect_discs(straightened_img, board_result, config):
             'center': (int(x), int(y)),
             'radius': r_use,
             'score': float(s),
-            'team': int(team),
-            'lab': labv,
+            'team':  int(team),
+            'lab':   labv,
         })
 
-    # --- Debug overlay --------------------------------------------------------
-    if cfg.get("debug_show_discs", True):
+    if config.get('disc_detection', {}).get("debug_show_discs", True):
         debug_show_discs(straightened_img, results, board_result)
 
-    # Enforce cap
     return results[:max_discs]
+
 
 
 def debug_show_discs(image, discs, board_result=None, title="Detected discs"):
