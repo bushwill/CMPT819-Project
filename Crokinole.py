@@ -58,11 +58,12 @@ def preprocess_image(img, target_size=None, max_dimension=1200):
 
 def balance_colors(image):
     """
-    Apply color balancing using histogram equalization per channel.
-    This spreads out color values to make input more consistent across different lighting conditions.
+    Apply gentle color balancing using histogram equalization.
+    This spreads out color values to make input more consistent across different lighting conditions,
+    while avoiding harsh artifacts that can interfere with edge detection.
     
-    Uses adaptive histogram equalization (CLAHE) for better local contrast while
-    maintaining global color balance.
+    Uses adaptive histogram equalization (CLAHE) with conservative settings and smoothing
+    to prevent regional artifacts.
     
     Args:
         image: Input RGB image (uint8)
@@ -76,15 +77,21 @@ def balance_colors(image):
     # Convert to LAB color space (better for color processing than RGB)
     img_lab = color.rgb2lab(img_float)
     
-    # Apply adaptive histogram equalization to L channel (luminance)
-    # This preserves colors while balancing brightness
+    # Apply very gentle adaptive histogram equalization to L channel (luminance)
+    # Use much lower clip_limit and auto kernel_size to reduce artifacts
     img_lab[:, :, 0] = exposure.equalize_adapthist(
         img_lab[:, :, 0] / 100.0,  # Normalize L channel to [0, 1]
-        clip_limit=0.03  # Limit contrast enhancement to avoid over-processing
+        kernel_size=None,  # Auto-select based on image size for smoother results
+        clip_limit=0.01,  # Very low limit to prevent harsh regional artifacts
+        nbins=256  # More bins for smoother histogram distribution
     ) * 100.0  # Scale back to LAB range
     
     # Convert back to RGB
     img_balanced = color.lab2rgb(img_lab)
+    
+    # Apply gentle gaussian smoothing to reduce any remaining artifacts
+    # This helps prevent false edges from being detected
+    img_balanced = filters.gaussian(img_balanced, sigma=0.5, channel_axis=-1)
     
     # Convert back to uint8
     img_balanced = (np.clip(img_balanced, 0, 1) * 255).astype(np.uint8)
@@ -121,15 +128,30 @@ def display_images(images, titles=None, figsize=(14, 7)):
 
 
 def detect_edges(img, config):
-    """Detect edges using Canny edge detection."""
+    """
+    Detect edges using Canny edge detection with noise suppression.
+    Applies morphological operations to reduce texture artifacts (wood grain)
+    while preserving strong circular edges.
+    """
     board_cfg = config['board_detection']
     gray_image = color.rgb2gray(img)
+    
+    # Apply Canny edge detection
     edges = feature.canny(
         gray_image,
         low_threshold=board_cfg['canny_low_threshold'],
         high_threshold=board_cfg['canny_high_threshold'],
         sigma=board_cfg['edge_sigma']
     )
+    
+    # Morphological closing to connect nearby edges (helps with broken circles)
+    # Use small structuring element to avoid connecting unrelated edges
+    edges = morphology.binary_closing(edges, morphology.disk(1))
+    
+    # Remove small isolated edge segments (texture noise)
+    # This removes wood grain artifacts while keeping circular ring edges
+    edges = morphology.remove_small_objects(edges, min_size=50)
+    
     return edges
 
 def detect_board_and_rings(edges, config):
@@ -279,14 +301,18 @@ def create_scoring_regions(img_shape, board_result):
     """
     Create a segmentation mask with scoring regions based on detected rings.
     
+    Ring naming (from outer to inner):
+    - ring_5: outermost ring (boundary between 0pt outside and 5pt region)
+    - ring_10: second ring (boundary between 5pt and 10pt regions)
+    - ring_15: third ring (boundary between 10pt and 15pt regions)
+    - center: innermost circle (boundary for 20pt center hole)
+    
     Returns a mask where pixel values represent point values:
     0 = outside board (beyond ring_5)
-    5 = between ring_5 and ring_15
-    10 = between ring_15 and ring_10
-    15 = between ring_10 and center
+    5 = between ring_5 and ring_10
+    10 = between ring_10 and ring_15
+    15 = between ring_15 and center
     20 = inside center hole
-    
-    Note: Uses board_result['radius'] as the calculated board boundary from ring_5.
     """
     if board_result is None:
         return None
@@ -295,33 +321,32 @@ def create_scoring_regions(img_shape, board_result):
     mask = np.zeros((h, w), dtype=np.uint8)
     
     board_center = board_result['center']
-    board_radius = board_result['radius']  # Calculated from ring_5
     detected_rings = board_result['rings']
     
     # Create coordinate grid
     y, x = np.ogrid[:h, :w]
     distances = np.sqrt((x - board_center[0])**2 + (y - board_center[1])**2)
     
-    # Get ring radii from detected rings
-    ring_5_r = detected_rings.get('ring_5', None)
-    ring_15_r = detected_rings.get('ring_15', None)
-    ring_10_r = detected_rings.get('ring_10', None)
-    center_r = detected_rings.get('center', None)
+    # Get ring radii from detected rings (from outer to inner)
+    ring_5_r = detected_rings.get('ring_5', None)    # outermost
+    ring_10_r = detected_rings.get('ring_10', None)  # middle-outer
+    ring_15_r = detected_rings.get('ring_15', None)  # middle-inner
+    center_r = detected_rings.get('center', None)    # innermost
     
     # Everything starts at 0 (outside board)
-    # Assign scoring values to the spaces BETWEEN rings
+    # Assign scoring values to the spaces BETWEEN rings, from outer to inner
     
-    # 5 point region: between ring_5 and ring_15
-    if ring_5_r is not None and ring_15_r is not None:
-        mask[(distances <= ring_5_r) & (distances > ring_15_r)] = 5
+    # 5 point region: between ring_5 (outer) and ring_10
+    if ring_5_r is not None and ring_10_r is not None:
+        mask[(distances <= ring_5_r) & (distances > ring_10_r)] = 5
     
-    # 10 point region: between ring_15 and ring_10
-    if ring_15_r is not None and ring_10_r is not None:
-        mask[(distances <= ring_15_r) & (distances > ring_10_r)] = 10
+    # 10 point region: between ring_10 and ring_15
+    if ring_10_r is not None and ring_15_r is not None:
+        mask[(distances <= ring_10_r) & (distances > ring_15_r)] = 10
     
-    # 15 point region: between ring_10 and center
-    if ring_10_r is not None and center_r is not None:
-        mask[(distances <= ring_10_r) & (distances > center_r)] = 15
+    # 15 point region: between ring_15 and center
+    if ring_15_r is not None and center_r is not None:
+        mask[(distances <= ring_15_r) & (distances > center_r)] = 15
     
     # 20 point region: inside center hole
     if center_r is not None:
@@ -377,23 +402,10 @@ def visualize_scoring_regions(img, scoring_mask):
     axes[2].set_title("Blended Overlay")
     axes[2].axis('off')
     
-    # Add legend
-    unique_scores = np.unique(scoring_mask)
-    legend_text = "Scoring Regions:\n"
-    for score in sorted(unique_scores):
-        if score == 0:
-            legend_text += f"  {score}pt: Outside board\n"
-        elif score == 20:
-            legend_text += f"  {score}pt: Center hole\n"
-        else:
-            legend_text += f"  {score}pt: Ring\n"
-    
-    plt.figtext(0.5, 0.02, legend_text, ha='center', fontsize=10, 
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
     plt.tight_layout()
     plt.show()
     
+    unique_scores = np.unique(scoring_mask)
     print(f"Scoring regions: {sorted(unique_scores)} points")
     for score in sorted(unique_scores):
         count = np.sum(scoring_mask == score)
@@ -1214,7 +1226,7 @@ def create_results_overlay(image, board_result, discs, labels, disc_scores):
     for name, r in board_result['rings'].items():
         circ = patches.Circle((cx, cy), r, linewidth=1.5, edgecolor='white', facecolor='none', alpha=0.7)
         ax.add_patch(circ)
-        ax.text(cx + r + 4, cy, name, color='white', fontsize=8)
+        ax.text(cx + r + 4, cy, name, color='black', fontsize=8, weight='bold')
 
     for ds in disc_scores:
         x, y = discs[ds.idx]['center']
