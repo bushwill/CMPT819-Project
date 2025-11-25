@@ -1,27 +1,27 @@
-image_name,success,pred_team1,pred_team2,gt_team1,gt_team2,error_team1,error_team2,total_error,num_discs,error_msg
-board.jpg,True,15,55,30,55,15.0,0.0,15.0,6,
-board2.jpg,True,35,35,30,35,5.0,0.0,5.0,10,
-board4.jpg,True,30,30,25,30,5.0,0.0,5.0,4,
-board5.jpg,True,15,30,30,40,15.0,10.0,25.0,4,
-board8.jpg,True,15,0,0,0,15.0,0.0,15.0,1,
-board9.jpg,True,30,40,30,30,0.0,10.0,10.0,6,
-ivan_board1.jpg,True,0,0,0,0,0.0,0.0,0.0,0,
-ivan_board2.jpg,False,0,0,25,20,,,,0,Board detection failed
-ivan_board3.jpg,True,5,10,15,20,10.0,10.0,20.0,2,
-ivan_board4.jpg,True,20,15,15,25,5.0,10.0,15.0,3,
-ivan_board5.jpg,True,40,20,35,35,5.0,15.0,20.0,5,
-ivan_board6.jpg,True,30,15,30,35,0.0,20.0,20.0,4,
-ivan_board7.jpg,True,50,10,45,35,5.0,25.0,30.0,5,
-ivan_board8.jpg,True,50,0,50,55,0.0,55.0,55.0,6,
-ivan_board9.jpg,True,65,25,65,75,0.0,50.0,50.0,9,
-ivan_board10.jpg,True,50,15,60,75,10.0,60.0,70.0,5,
-sam_board1.jpg,False,0,0,0,0,,,,0,Board detection failed
-sam_board2.jpg,False,0,0,15,25,,,,0,Board detection failed
-sam_board3.jpg,False,0,0,25,35,,,,0,Board detection failed
-sam_board4.jpg,False,0,0,5,15,,,,0,Board detection failed
-sam_board5.jpg,False,0,0,10,10,,,,0,Board detection failed
-sam_board6.jpg,False,0,0,35,55,,,,0,Board detection failed
-sam_board7.jpg,False,0,0,10,30,,,,0,Board detection failed
-sam_board8.jpg,False,0,0,5,15,,,,0,Board detection failed
-sam_board9.jpg,False,0,0,15,15,,,,0,Board detection failed
-sam_board10.jpg,False,0,0,10,20,,,,0,Board detection failed
+image_name,success,pred_team1,pred_team2,gt_team1,gt_team2,abs_error_team1,abs_error_team2,error_pct_team1,error_pct_team2,num_discs,error_msg
+board.jpg,True,15.0,55.0,30,55,15.0,0.0,50.0,0.0,6,
+board2.jpg,True,35.0,35.0,30,35,5.0,0.0,16.666666666666664,0.0,9,
+board4.jpg,True,30.0,30.0,25,30,5.0,0.0,20.0,0.0,4,
+board5.jpg,True,15.0,45.0,30,40,15.0,5.0,50.0,12.5,5,
+board8.jpg,True,15.0,0.0,0,0,15.0,0.0,100.0,0.0,1,
+board9.jpg,True,30.0,45.0,30,30,0.0,15.0,0.0,50.0,7,
+ivan_board1.jpg,True,0.0,0.0,0,0,0.0,0.0,0.0,0.0,0,
+ivan_board2.jpg,True,25.0,15.0,25,20,0.0,5.0,0.0,25.0,3,
+ivan_board3.jpg,True,5.0,10.0,15,20,10.0,10.0,66.66666666666666,50.0,2,
+ivan_board4.jpg,True,20.0,15.0,15,25,5.0,10.0,33.33333333333333,40.0,3,
+ivan_board5.jpg,True,50.0,20.0,35,35,15.0,15.0,42.857142857142854,42.857142857142854,6,
+ivan_board6.jpg,True,30.0,15.0,30,35,0.0,20.0,0.0,57.14285714285714,4,
+ivan_board7.jpg,True,40.0,10.0,45,35,5.0,25.0,11.11111111111111,71.42857142857143,4,
+ivan_board8.jpg,True,50.0,0.0,50,55,0.0,55.0,0.0,100.0,6,
+ivan_board9.jpg,True,65.0,25.0,65,75,0.0,50.0,0.0,66.66666666666666,9,
+ivan_board10.jpg,True,50.0,15.0,60,75,10.0,60.0,16.666666666666664,80.0,5,
+sam_board1.jpg,False,,,0,0,,,,,0,Board detection failed
+sam_board2.jpg,False,,,15,25,,,,,0,Board detection failed
+sam_board3.jpg,False,,,25,35,,,,,0,Board detection failed
+sam_board4.jpg,False,,,5,15,,,,,0,Board detection failed
+sam_board5.jpg,False,,,10,10,,,,,0,Board detection failed
+sam_board6.jpg,False,,,35,55,,,,,0,Board detection failed
+sam_board7.jpg,False,,,10,30,,,,,0,Board detection failed
+sam_board8.jpg,False,,,5,15,,,,,0,Board detection failed
+sam_board9.jpg,False,,,15,15,,,,,0,Board detection failed
+sam_board10.jpg,False,,,10,20,,,,,0,Board detection failed
