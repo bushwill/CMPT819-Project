@@ -425,21 +425,50 @@ def visualize_scoring_regions(img, scoring_mask):
         count = np.sum(scoring_mask == score)
         percentage = (count / scoring_mask.size) * 100
         print(f"  {score}pt region: {count} pixels ({percentage:.1f}%)")
-
-
 # -----------------------------
 # STEP 5: Disc detection + colour grouping
 # -----------------------------
 
-def _expected_disc_radius(board_result, config, pad_frac=0.10, min_px=4):
-    """Calculate expected disc radius from center ring."""
-    rings = board_result['rings']
-    center_ring_data = rings.get('center', {})
-    r0 = float(center_ring_data.get('radius', 0.0)) if isinstance(center_ring_data, dict) else 0.0
+def _board_brightness(straightened_img, board_result, inset_px=8):
+    """
+    Estimate board 'whiteness' / brightness in the playable area.
 
+    Returns a single scalar in [0, 1] (median grayscale value inside play area).
+    We use the *raw* grayscale (no equalize_adapthist) so numbers are comparable
+    across runs, e.g. 0.53, 0.94, etc.
+    """
+    h, w = straightened_img.shape[:2]
+
+    # raw grayscale in [0,1]
+    img_f = straightened_img.astype(float) / 255.0
+    gray  = color.rgb2gray(img_f)
+
+    # playable mask (uses ring_5 / outer)
+    play_mask = _play_area_mask(
+        straightened_img.shape,
+        board_result,
+        inset_px=inset_px
+    )
+
+    vals = gray[play_mask]
+    if vals.size == 0:
+        # fallback: whole image
+        vals = gray.ravel()
+
+    return float(np.median(vals))
+
+
+def _expected_disc_radius(board_result, config, pad_frac=0.10, min_px=4):
+    """
+    Use the 'center' ring if present; otherwise approximate it from outer radius
+    and CONFIG['ring_ratios']['center'].
+    """
+    rings = board_result['rings']
+    r0 = _ring_radius_value(rings.get('center', 0.0), default=0.0)
+
+    # Fallback: approximate from outer radius + ratio
     if r0 <= 0.0:
-        outer_ring_data = rings.get('outer', {})
-        outer_r = float(outer_ring_data.get('radius', 0.0)) if isinstance(outer_ring_data, dict) else 0.0
+        outer_r = _ring_radius_value(rings.get('outer', 0.0), default=0.0)
         if outer_r > 0:
             center_ratio = config.get('ring_ratios', {}).get('center', 0.05)
             r0 = outer_r * center_ratio
@@ -452,17 +481,20 @@ def _expected_disc_radius(board_result, config, pad_frac=0.10, min_px=4):
 
 
 def _play_area_mask(shape, board_result, inset_px=4):
-    """Create mask for playable board area."""
+    """
+    Mask for the playable wood:
+    inside ring_5 (if present) or 0.95*outer as fallback.
+    """
     h, w = shape[:2]
     yy, xx = np.mgrid[0:h, 0:w]
     cx, cy = board_result['center']
-    rings = board_result['rings']
+    rings = board_result.get('rings', {})
 
-    outer_ring_data = rings.get('outer', {})
-    rout = float(outer_ring_data.get('radius', 0.0)) if isinstance(outer_ring_data, dict) else 0.0
-    
-    ring_5_data = rings.get('ring_5', {})
-    r5 = float(ring_5_data.get('radius', 0.95 * rout if rout > 0 else 0.0)) if isinstance(ring_5_data, dict) else (0.95 * rout if rout > 0 else 0.0)
+    rout = _ring_radius_value(rings.get('outer', 0.0), default=0.0)
+
+    r5_default = 0.95 * rout if rout > 0 else 0.0
+    r5 = _ring_radius_value(rings.get('ring_5', r5_default), default=r5_default)
+
 
     r_play_outer = r5 if r5 > 0 else rout
     if rout > 0 and r5 > 0:
@@ -483,7 +515,10 @@ def _edge_ring(edg, x, y, r, n=48):
 
 
 def _inside_stats(lum, x, y, r):
-    """Mean/std inside disc, and mean in outer ring."""
+    """
+    Mean/std inside disc, and mean in a thin outer ring.
+    Returns (mu_in, sd_in, mu_out).
+    """
     h, w = lum.shape
     yy, xx = np.ogrid[:h, :w]
     d = np.hypot(xx - x, yy - y)
@@ -500,7 +535,10 @@ def _inside_stats(lum, x, y, r):
 
 
 def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
-    """Sample grayscale values on mid-radius circle."""
+    """
+    Sample grayscale values on a mid-radius circle (frac * r) around (x,y).
+    Returns (std, mean). Real discs should have relatively low std.
+    """
     h, w = lum.shape
     if r <= 2:
         return 0.0, 0.0
@@ -514,7 +552,7 @@ def _angular_uniformity(lum, x, y, r, n=36, frac=0.5):
 
 
 def _lab_patch_mean(lab_img, x, y, half=3):
-    """Mean Lab colour in square patch around (x,y)."""
+    """Mean Lab colour in a small square patch around (x,y)."""
     h, w = lab_img.shape[:2]
     x0 = max(0, x - half)
     x1 = min(w, x + half + 1)
@@ -525,22 +563,43 @@ def _lab_patch_mean(lab_img, x, y, half=3):
 
 
 def _kmeans2_lab(feats, seed=0):
-    """K-means clustering with K=2 on Lab features."""
+    """
+    Tiny K=2 k-means on Lab features; returns labels (0/1) and centroids (2x3).
+
+    Handles edge cases:
+      - 0 discs  → returns empty labels, dummy centroids
+      - 1 disc   → puts it in cluster 0 and duplicates centroid for cluster 1
+    """
+    # No discs
     if len(feats) == 0:
         return np.array([], dtype=int), np.zeros((2, 3))
 
     X = np.asarray(feats, float)
+    n = X.shape[0]
+
+    # Single disc: avoid k-means++ with degenerate probabilities
+    if n == 1:
+        labels = np.array([0], dtype=int)
+        c0 = X[0]
+        C = np.stack([c0, c0], axis=0)   # both centroids identical
+        return labels, C
+
     rng = np.random.default_rng(seed)
 
-    c0 = X[rng.integers(0, len(X))]
+    # k-means++ init for K=2
+    c0 = X[rng.integers(0, n)]
     d2 = np.sum((X - c0) ** 2, axis=1)
-    d2_sum = d2.sum()
-    if d2_sum < 1e-9:
-        c1 = X[rng.integers(0, len(X))]
-    else:
-        probs = d2 / d2_sum
-        probs = probs / probs.sum()  # Normalize to ensure sum is exactly 1.0
-        c1 = X[rng.choice(len(X), p=probs)]
+    total = d2.sum()
+
+    # Just in case all points are identical (total == 0)
+    if total <= 0:
+        labels = np.zeros(n, dtype=int)
+        c0 = X.mean(axis=0)
+        C = np.stack([c0, c0], axis=0)
+        return labels, C
+
+    probs = d2 / total
+    c1 = X[rng.choice(n, p=probs)]
     C = np.stack([c0, c1], axis=0)
 
     for _ in range(20):
@@ -548,6 +607,7 @@ def _kmeans2_lab(feats, seed=0):
         L = np.argmin(D, axis=1)
         C_new = []
         for k in (0, 1):
+
             if np.any(L == k):
                 C_new.append(X[L == k].mean(axis=0))
             else:
@@ -559,33 +619,197 @@ def _kmeans2_lab(feats, seed=0):
 
     return L.astype(int), C
 
+def _select_disc_params(board_brightness, r0):
+    """
+    Choose disc-detection thresholds based on board brightness.
+
+    board_brightness is in [0,1], e.g. ~0.98 for very bright white board,
+    ~0.23 for your dark blue board.
+    """
+    # --- PRESET 1: Bright white board (your white test image) -----------
+    if 0.95 <= board_brightness <= 1.01:
+        return {
+            "name": "bright_white",
+            "ring_margin": 0.25 * r0,   # suppress only very near rings (not center)
+            "e_hit_min": 0.28,
+            "sd_in_max": 0.15,
+            "contrast_min": 0.18,
+            "delta_board_min": 0.1,
+            "mid_std_max": 0.80,
+        }
+
+    # --- PRESET 2: Medium wood boards -----------------------------------
+    if 0.45 <= board_brightness < 0.95:
+        # Slightly darker / higher contrast wood
+        if board_brightness < 0.65:
+            return {
+                "name": "mid_wood",
+                "ring_margin": 0.30 * r0,
+                # slightly easier edge requirement
+                "e_hit_min": 0.18,      # was 0.22
+
+                # allow a bit more variation inside the disc
+                "sd_in_max": 0.25,      # was 0.18
+
+                # keep brightness-based filters as-is
+                "contrast_min": 0.08,
+                "delta_board_min": 0.09,
+
+                # allow slightly less perfect angular uniformity
+                "mid_std_max": 1.00,    # was 0.90
+            }
+        if 0.8 <= board_brightness <0.95 :
+            return{
+                "name": "light_wood_hard",
+                "ring_margin": 0.32 * r0,   # let discs a bit closer to rings
+                "e_hit_min": 0.14,          # allow weaker edges
+                "sd_in_max": 0.22,          # allow more texture / highlights inside
+                "contrast_min": 0.001,       # OK with low contrast vs surroundings
+                "delta_board_min": 0.001,    # OK with being close to global board L
+                "mid_std_max": 1.3,   
+            }
+
+        # Brighter mid-wood (like your new board: ~0.688)
+        # → make thresholds more forgiving for pale / white discs.
+        return {
+            "name": "mid_wood_soft",
+            "ring_margin": 0.32 * r0,   # let discs a bit closer to rings
+            "e_hit_min": 0.10,          # allow weaker edges
+            "sd_in_max": 0.25,          # allow more texture / highlights inside
+            "contrast_min": 0.001,       # OK with low contrast vs surroundings
+            "delta_board_min": 0.001,    # OK with being close to global board L
+            "mid_std_max": 1.3,        # don’t over-penalize mild angular texture
+        }
+
+    # --- PRESET 3: Dark board / odd lighting (your blue board) ----------
+    if board_brightness < 0.45:
+        # Dark cloth / shaded board.
+        return {
+            "name": "dark_or_shaded",
+            "ring_margin": 0.35 * r0,
+            "e_hit_min": 0.24,
+            "sd_in_max": 0.18,
+            "contrast_min": 0.06,
+            "delta_board_min": 0.05,
+            "mid_std_max": 0.95,
+        }
+
+    # --- Fallback: if we somehow land between bands ----------------------
+    return {
+        "name": "default",
+        "ring_margin": 0.30 * r0,
+        "e_hit_min": 0.25,
+        "sd_in_max": 0.17,
+        "contrast_min": 0.10,
+        "delta_board_min": 0.07,
+        "mid_std_max": 0.90,
+    }
+
+def _ring_radius_value(v, default=0.0):
+    """
+    Extract a numeric radius from a ring entry.
+
+    Handles cases where v is:
+      - a plain number (int/float)
+      - a dict with 'radius' or 'r'
+      - a (x, y, r) style tuple/list
+    Falls back to `default` if it can't make sense of it.
+    """
+    if isinstance(v, (int, float, np.floating)):
+        return float(v)
+
+    if isinstance(v, dict):
+        for key in ("radius", "r", "rad"):
+            val = v.get(key, None)
+            if isinstance(val, (int, float, np.floating)):
+                return float(val)
+        # last resort: try to cast whole dict, but if it fails, use default
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    if isinstance(v, (tuple, list)) and len(v) >= 3:
+        r = v[2]
+        if isinstance(r, (int, float, np.floating)):
+            return float(r)
+
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
 
 def detect_discs(straightened_img, board_result, config):
-    """Detect discs using center ring size for radius estimation."""
-    import time
-    t_start = time.time()
-    verbose = config.get('verbose', False)
-    
+    """
+    Dispatch between:
+      - Smart Ring logic for the mid-wood board (~0.5 brightness).
+      - Generic brightness-preset logic (_select_disc_params) for everything else.
+    """
+    # Use the same brightness definition you logged before
+    board_bright = _board_brightness(straightened_img, board_result, inset_px=8)
+
+    # Mid-wood band where the Smart Ring algo worked well (your 0.518 board)
+    if 0.45 <= board_bright < 0.60:
+        print(f"[DD] board_brightness={board_bright:.3f} → Smart Ring (mid-wood) path")
+        return _detect_discs_midwood_smart(straightened_img, board_result, config)
+    else:
+        print(f"[DD] board_brightness={board_bright:.3f} → generic preset path")
+        return _detect_discs_generic(straightened_img, board_result, config, board_bright)
+
+def _detect_discs_generic(straightened_img, board_result, config, board_bright=None):
+    """
+    Original disc detection tied to _select_disc_params.
+    Used for:
+      - bright white board
+      - bright mid-wood board (~0.68)
+      - dark/shaded board
+      - any 'other' brightness
+    """
     h, w = straightened_img.shape[:2]
-    if verbose:
-        print(f"[DD] Processing image of size {w}x{h} = {w*h:,} pixels")
-    
-    r0, r_min, r_max = _expected_disc_radius(board_result, config, pad_frac=0.30)
+    r0, r_min, r_max = _expected_disc_radius(
+        board_result, config, pad_frac=0.30
+    )
 
     if r0 is None:
-        if verbose:
-            print("[DD] No center ring radius; cannot infer disc size.")
+        print("[DD] No center ring radius; cannot infer disc size.")
         return []
 
+    # ---- Board centre & ring radii for geometric filtering ------------------
     bcx, bcy = board_result['center']
-    ring_radii = [
-        float(ring_data['radius']) for name, ring_data in board_result['rings'].items()
-        if name not in ('outer', 'center')
-    ]
+    raw_rings = board_result.get('rings', {})
+    ring_radii = []
+    for name, rinfo in raw_rings.items():
+        if name == 'outer':
+            continue
+        ring_radii.append(_ring_radius_value(rinfo, default=0.0))
 
     cfg = config.get('disc_detection', {})
     max_discs = cfg.get('max_discs', 28)
 
+    # ---- Estimate board brightness and choose thresholds --------------------
+    if board_bright is None:
+        board_bright = _board_brightness(straightened_img, board_result, inset_px=8)
+
+    params = _select_disc_params(board_bright, r0)
+    preset_name = params.get("name", "default")
+    print(f"[DD] preset={preset_name}")
+    white_like = (preset_name in ("bright_white", "mid_wood_soft"))
+
+    if preset_name == "bright_white":
+        # white board: allow a disc slightly off-center in the 20-hole
+        center_forbid = 0.5 * r0
+    else:
+        # wood boards: just kill any circle whose centre lives in the 20-hole
+        center_forbid = 0.9 * r0
+
+    ring_margin      = params["ring_margin"]
+    e_hit_min        = params["e_hit_min"]
+    sd_in_max        = params["sd_in_max"]
+    contrast_min     = params["contrast_min"]
+    delta_board_min  = params["delta_board_min"]
+    mid_std_max      = params["mid_std_max"]
+
+    # --- Pre-processing ------------------------------------------------------
     img_f = straightened_img.astype(float) / 255.0
     sharp = filters.unsharp_mask(img_f, radius=2, amount=1.5)
     lum   = color.rgb2gray(sharp)
@@ -603,27 +827,19 @@ def detect_discs(straightened_img, board_result, config):
         low_threshold=low_t, high_threshold=high_t
     )
     edges = np.maximum(e1, e2)
-    t2 = time.time()
-    if verbose:
-        print(f"[DD] Edge detection: {t2-t_start:.2f}s")
 
-    # --- Restrict to playable wood -------------------------------------------
+    # --- Restrict to playable wood ------------------------------------------
     play_mask = _play_area_mask(
         straightened_img.shape,
         board_result,
         inset_px=max(3, int(0.003 * min(h, w)))
     )
 
+    # --- Hough circles in tight radius band ---------------------------------
     radii = np.arange(max(2, r_min), max(3, r_max + 1), 1, dtype=int)
-    if verbose:
-        print(f"[DD] Searching {len(radii)} radii from {r_min} to {r_max}")
-    t3 = time.time()
     hspaces = transform.hough_circle(edges, radii)
-    t4 = time.time()
-    if verbose:
-        print(f"[DD] Hough circle transform: {t4-t3:.2f}s")
     acc, hcx, hcy, rs = transform.hough_circle_peaks(
-        hspaces, radii, total_num_peaks=80, min_xdistance=int(r0*0.5), min_ydistance=int(r0*0.5)
+        hspaces, radii, total_num_peaks=140
     )
 
     cands = []
@@ -635,36 +851,81 @@ def detect_discs(straightened_img, board_result, config):
         if not (0 <= x < w and 0 <= y < h and play_mask[y, x]):
             continue
 
+        # --- centre too close to exact board centre? ------------------------
         dist_c = np.hypot(x - bcx, y - bcy)
-        near_ring = False
-        ring_margin = 0.25 * r0
-        for rr in ring_radii:
-            if abs(dist_c - rr) < ring_margin:
-                near_ring = True
-                break
-        if near_ring:
+        if center_forbid > 0 and dist_c < center_forbid:
+            # treat as empty 20-hole / artifact
             continue
 
+        # --- local stats FIRST (needed for Smart Ring on white) -------------
         e_hit = _edge_ring(edges, x, y, r, n=50)
         mu_in, sd_in, mu_out = _inside_stats(lum, x, y, r)
         contrast    = abs(mu_in - mu_out)
         delta_board = abs(mu_in - med)
         mid_std, mid_mean = _angular_uniformity(lum, x, y, r, n=40, frac=0.5)
 
+        # brightness relative to board
+        diff_val  = med - mu_in          # >0 darker than board, <0 lighter
+        # --- classify brightness --------------------------------------------
+        is_dark_disc  = diff_val > 0.05
+        is_light_disc = diff_val < -0.02
+        is_ghost      = not (is_dark_disc or is_light_disc)
+
+        # --- proximity to any scoring ring ----------------------------------
+        on_ring = any(abs(dist_c - rr) < ring_margin for rr in ring_radii)
+
+        # Extra clean-up for the very bright white board:
+        # kill board-coloured blobs (ghosts) unless they are insanely "disc-like".
+        if preset_name == "bright_white" and is_ghost:
+            # Only keep if they are VERY strong edges and clearly different
+            # from board/background – real discs should be classified as
+            # dark/light, so this almost never triggers for them.
+            if not (e_hit >= 0.40 and contrast >= 0.25 and delta_board >= 0.10):
+                continue
+        relaxed_for_ring = False
+
+        if white_like and on_ring:
+            # White-ish boards (bright white + bright mid-wood):
+            #   - keep clearly dark/light discs on the line
+            #   - kill wood-coloured ghosts or ultra-weak edges
+            if is_ghost or e_hit < 0.5 * e_hit_min:
+                continue
+            relaxed_for_ring = True
+        elif on_ring:
+            # Non-white-like boards: still hard-suppress candidates on rings
+            continue
+
+        # --- brightness-dependent thresholds --------------------------------
+        # Make edge + uniformity checks much more forgiving for white-like boards
+        base_e_min = e_hit_min
+        if white_like:
+            base_e_min *= 0.5      # global relaxation for bright_white / mid_wood_soft
+
+        effective_e_min = base_e_min
+        if relaxed_for_ring:
+            # even more lenient when we *know* it's sitting on a scoring line
+            effective_e_min *= 0.7
+
+        eff_sd_in_max   = sd_in_max  * (1.3 if white_like else 1.0)
+        eff_mid_std_max = mid_std_max * (1.3 if white_like else 1.0)
+
         if (
-            e_hit      >= 0.28 and
-            sd_in      <= 0.15 and
-            contrast   >= 0.12 and
-            delta_board >= 0.08 and
-            mid_std    <= 0.80
+            e_hit       < effective_e_min or
+            sd_in       > eff_sd_in_max or
+            contrast    < contrast_min or
+            delta_board < delta_board_min or
+            mid_std     > eff_mid_std_max
         ):
-            cands.append((x, y, r, float(e_hit)))
+            continue
+
+
+        cands.append((x, y, r, float(e_hit)))
 
     if not cands:
-        if verbose:
-            print("[DD] No disc candidates after photometric checks.")
+        print("[DD] No disc candidates after photometric checks.")
         return []
 
+    # --- Non-max suppression on centres -------------------------------------
     cands.sort(key=lambda t: t[3], reverse=True)
     picked = []
     for x, y, r, s in cands:
@@ -677,10 +938,10 @@ def detect_discs(straightened_img, board_result, config):
             picked.append((x, y, r, s))
 
     if not picked:
-        if verbose:
-            print("[DD] All candidates suppressed by NMS.")
+        print("[DD] All candidates suppressed by NMS.")
         return []
 
+    # --- Colour features & two-cluster k-means ------------------------------
     lab_img = color.rgb2lab(straightened_img.astype(float) / 255.0)
     feats = [
         _lab_patch_mean(
@@ -702,10 +963,244 @@ def detect_discs(straightened_img, board_result, config):
             'lab':    labv,
         })
 
-    if cfg.get("debug_show_discs", False):
+    if cfg.get("debug_show_discs", True):
         debug_show_discs(straightened_img, results, board_result)
 
     return results[:max_discs]
+def _detect_discs_midwood_smart(straightened_img, board_result, config):
+    """
+    Smart Ring Logic tuned for the mid-wood board (~0.5 brightness).
+    Goal: kill ring-only ghosts aggressively, keep real discs (dark or light).
+    """
+    h, w = straightened_img.shape[:2]
+    r0, r_min, r_max = _expected_disc_radius(board_result, config, pad_frac=0.30)
+
+    if r0 is None:
+        print("[DD] No center ring radius; cannot infer disc size.")
+        return []
+
+    # Board centre & ring radii
+    bcx, bcy = board_result['center']
+    raw_rings = board_result.get('rings', {})
+    ring_radii = []
+    for name, rinfo in raw_rings.items():
+        if name == 'outer':
+            continue
+        ring_radii.append(_ring_radius_value(rinfo, default=0.0))
+
+    cfg = config.get('disc_detection', {})
+    max_discs = cfg.get('max_discs', 28)
+
+    # --- 1. Board type -------------------------------------------------------
+    raw_gray = color.rgb2gray(straightened_img)
+    board_median_brightness = float(np.median(raw_gray))
+    is_wood_board = board_median_brightness < 0.60
+
+    # --- 2. Thresholds -------------------------------------------------------
+    if not is_wood_board:
+        # White board path (probably not used for 0.518)
+        print(f"[DD] WHITE board ({board_median_brightness:.2f}). Strict mode.")
+        THR_EDGE  = 0.25
+        THR_DELTA = 0.08
+        C_LOW, C_HIGH = 0.05, 0.98
+        # The other thresholds are unused in this path
+    else:
+        print(f"[DD] WOOD board ({board_median_brightness:.2f}). Smart Ring mode.")
+        # STRONGER gating to kill ghosts
+        THR_EDGE          = 0.19   # min edge strength off-ring
+        THR_EDGE_RING     = 0.08   # min edge strength on-ring
+        THR_DELTA         = 0.05   # min |disc - board| (brightness delta)
+        # Colour-based ghost vs disc split:
+        GHOST_COLOR_T     = 0.15   # abs_delta < this ⇒ ghost-coloured
+        THR_CONTRAST_DISC = 0.15   # min contrast for real discs
+        THR_CONTRAST_GHOST = 0.27  # min contrast for ghost-coloured blobs
+        SD_IN_MAX         = 0.20
+        MID_STD_MAX       = 0.60
+        C_LOW, C_HIGH     = 0.02, 0.40
+
+    # --- 3. Image processing -------------------------------------------------
+    img_f = straightened_img.astype(float) / 255.0
+    sharp = filters.unsharp_mask(img_f, radius=2, amount=1.5)
+    lum   = color.rgb2gray(sharp)
+    lum   = exposure.equalize_adapthist(lum, clip_limit=0.01)
+
+    med = float(np.median(lum))
+
+    if is_wood_board:
+        low_t, high_t = C_LOW, C_HIGH
+    else:
+        low_t  = max(0.05, 0.66 * med)
+        high_t = min(0.98, 1.33 * med)
+
+    e1 = feature.canny(
+        lum, sigma=1.5,
+        low_threshold=low_t, high_threshold=high_t
+    )
+    e2 = feature.canny(
+        1.0 - lum, sigma=1.5,
+        low_threshold=low_t, high_threshold=high_t
+    )
+    edges = np.maximum(e1, e2)
+
+    # playable area
+    play_mask = _play_area_mask(
+        straightened_img.shape,
+        board_result,
+        inset_px=max(3, int(0.003 * min(h, w)))
+    )
+
+    # --- 4. Hough transform --------------------------------------------------
+    radii = np.arange(max(2, r_min), max(3, r_max + 1), 1, dtype=int)
+    hspaces = transform.hough_circle(edges, radii)
+    acc, hcx, hcy, rs = transform.hough_circle_peaks(
+        hspaces, radii, total_num_peaks=160
+    )
+
+    cands = []
+    for a, x, y, r in zip(acc, hcx, hcy, rs):
+        x = int(x)
+        y = int(y)
+        r = int(r)
+
+        if not (0 <= x < w and 0 <= y < h and play_mask[y, x]):
+            continue
+
+        # --- local stats -----------------------------------------------------
+        e_hit = _edge_ring(edges, x, y, r, n=50)
+        mu_in, sd_in, mu_out = _inside_stats(lum, x, y, r)
+        mid_std, mid_mean = _angular_uniformity(lum, x, y, r, n=40, frac=0.5)
+
+        diff_val  = med - mu_in        # >0 darker than board, <0 lighter
+        abs_delta = abs(diff_val)
+        contrast  = abs(mu_in - mu_out)
+
+        # --- which ring? -----------------------------------------------------
+        dist_c  = np.hypot(x - bcx, y - bcy)
+        on_ring = any(abs(dist_c - rr) < 0.4 * r0 for rr in ring_radii)
+
+        keep_it = False
+
+        if is_wood_board:
+            # --- classify by colour similarity to board ----------------------
+            is_ghost      = (abs_delta < GHOST_COLOR_T)
+            is_dark_disc  = (diff_val >=  GHOST_COLOR_T)
+            is_light_disc = (diff_val <= -GHOST_COLOR_T)
+            is_disc       = is_dark_disc or is_light_disc
+
+            if on_ring:
+                if is_disc:
+                    # Real disc on scoring line: easier contrast bar
+                    if (
+                        e_hit    >= THR_EDGE_RING and
+                        abs_delta >= THR_DELTA and
+                        contrast >= THR_CONTRAST_DISC
+                    ):
+                        keep_it = True
+                elif is_ghost:
+                    # Ghost-coloured on the ring:
+                    # only keep if insanely contrasty (almost never)
+                    if (
+                        e_hit    >= THR_EDGE_RING and
+                        abs_delta >= THR_DELTA and
+                        contrast >= THR_CONTRAST_GHOST
+                    ):
+                        keep_it = True
+            else:
+                # NOT on a ring
+                if is_disc:
+                    # Real disc off-line: no need for huge contrast
+                    if (
+                        e_hit    >= THR_EDGE and
+                        abs_delta >= THR_DELTA and
+                        contrast >= THR_CONTRAST_DISC
+                    ):
+                        keep_it = True
+                elif is_ghost:
+                    # Ghost-coloured off-line: require strong contrast
+                    if (
+                        e_hit    >= THR_EDGE and
+                        abs_delta >= THR_DELTA and
+                        contrast >= THR_CONTRAST_GHOST
+                    ):
+                        keep_it = True
+        else:
+            # White-board fallback (no ghost logic, just strict ring-kill)
+            if (not on_ring) and e_hit >= THR_EDGE and abs_delta >= THR_DELTA:
+                keep_it = True
+
+        # Global texture gate
+        if keep_it:
+            if is_wood_board and (sd_in > SD_IN_MAX or mid_std > MID_STD_MAX):
+                keep_it = False
+
+        if keep_it:
+            cands.append((x, y, r, float(e_hit)))
+
+    if not cands:
+        return []
+
+    # --- 5. Non-max suppression ---------------------------------------------
+    cands.sort(key=lambda t: t[3], reverse=True)
+    picked = []
+    for x, y, r, s in cands:
+        keep = True
+        for X, Y, R, S in picked:
+            if np.hypot(x - X, y - Y) < 0.9 * max(r, R):
+                keep = False
+                break
+        if keep:
+            picked.append((x, y, r, s))
+
+    # --- 6. Remove center-hole artifacts ------------------------------------
+    cx, cy = board_result['center']
+    rings = board_result.get('rings', {})
+    r_center_raw = rings.get('center', 0.0)
+    r_center = _ring_radius_value(r_center_raw, default=0.0)
+    if r_center > 0 and r0 is not None:
+        filtered = []
+        center_forbid = r_center + 0.5 * r0
+        for x, y, r, s in picked:
+            dist = np.hypot(x - cx, y - cy)
+            if dist <= center_forbid:
+                continue
+            filtered.append((x, y, r, s))
+        picked = filtered
+
+    if not picked:
+        return []
+
+    # --- 7. Colour clustering -----------------------------------------------
+    lab_img = color.rgb2lab(straightened_img.astype(float) / 255.0)
+    feats = [
+        _lab_patch_mean(
+            lab_img, x, y,
+            half=min(6, max(3, int(0.5 * r0)))
+        )
+        for (x, y, r, s) in picked
+    ]
+    team_labels, centroids = _kmeans2_lab(feats, seed=0)
+
+    r_use = int(round(r0))
+    results = []
+    for (x, y, r, s), labv, team in zip(picked, feats, team_labels):
+        results.append({
+            'center': (int(x), int(y)),
+            'radius': r_use,
+            'score':  float(s),
+            'team':   int(team),
+            'lab':    labv,
+        })
+
+    if cfg.get("debug_show_discs", True):
+        debug_show_discs(straightened_img, results, board_result)
+
+    return results[:max_discs]
+
+
+
+
+
+
 
 
 
@@ -716,18 +1211,22 @@ def debug_show_discs(image, discs, board_result=None, title="Detected discs"):
     Colours indicate team 0 vs 1 if available.
     """
     if image is None or len(discs) == 0:
+        print("[DD] No discs to visualize")
         return
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     ax.imshow(image)
 
+    # Show board centre and rings
     if board_result is not None:
         cx, cy = board_result['center']
         ax.plot(cx, cy, 'rx', markersize=8, mew=2)
-        for name, ring_data in board_result['rings'].items():
-            r = ring_data['radius'] if isinstance(ring_data, dict) else ring_data
+        for name, r in board_result['rings'].items():
+            rad = _ring_radius_value(r, default=0.0)
+            if rad <= 0:
+                continue
             circ = patches.Circle(
-                (cx, cy), r,
+                (cx, cy), rad,
                 linewidth=1.0,
                 edgecolor='white',
                 facecolor='none',
@@ -759,6 +1258,9 @@ def debug_show_discs(image, discs, board_result=None, title="Detected discs"):
     ax.set_title(f"{title} (N={len(discs)})")
     ax.axis('off')
     plt.show()
+
+
+
 
 
 def extract_disc_colours(image, discs, patch_half=3):
@@ -1063,6 +1565,7 @@ def run_complete_pipeline(img_path, config, team1_20s=0, team2_20s=0):
         if verbose:
             print("Creating scoring regions...")
         scoring_mask = create_scoring_regions(img.shape, board_result)
+
         line_band = np.zeros_like(scoring_mask, dtype=bool)
         
         board_info = {
@@ -1126,3 +1629,4 @@ def run_complete_pipeline(img_path, config, team1_20s=0, team2_20s=0):
         import traceback
         traceback.print_exc()
         return result
+
