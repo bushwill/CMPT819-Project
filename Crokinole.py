@@ -632,8 +632,8 @@ def _select_disc_params(board_brightness, r0):
             "ring_margin": 0.25 * r0,   # suppress only very near rings (not center)
             "e_hit_min": 0.28,
             "sd_in_max": 0.15,
-            "contrast_min": 0.12,
-            "delta_board_min": 0.08,
+            "contrast_min": 0.18,
+            "delta_board_min": 0.1,
             "mid_std_max": 0.80,
         }
 
@@ -854,13 +854,22 @@ def _detect_discs_generic(straightened_img, board_result, config, board_bright=N
 
         # brightness relative to board
         diff_val  = med - mu_in          # >0 darker than board, <0 lighter
-        is_dark_disc  = diff_val > 0.05  # strong dark
-        is_light_disc = diff_val < -0.02 # strong light
+        # --- classify brightness --------------------------------------------
+        is_dark_disc  = diff_val > 0.05
+        is_light_disc = diff_val < -0.02
         is_ghost      = not (is_dark_disc or is_light_disc)
 
         # --- proximity to any scoring ring ----------------------------------
-        # --- proximity to any scoring ring ----------------------------------
         on_ring = any(abs(dist_c - rr) < ring_margin for rr in ring_radii)
+
+        # Extra clean-up for the very bright white board:
+        # kill board-coloured blobs (ghosts) unless they are insanely "disc-like".
+        if preset_name == "bright_white" and is_ghost:
+            # Only keep if they are VERY strong edges and clearly different
+            # from board/background – real discs should be classified as
+            # dark/light, so this almost never triggers for them.
+            if not (e_hit >= 0.40 and contrast >= 0.25 and delta_board >= 0.10):
+                continue
         relaxed_for_ring = False
 
         if white_like and on_ring:
