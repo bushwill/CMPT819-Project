@@ -658,6 +658,16 @@ def _select_disc_params(board_brightness, r0):
                 # allow slightly less perfect angular uniformity
                 "mid_std_max": 1.00,    # was 0.90
             }
+        if 0.65 <= board_brightness <0.8 :
+            return{
+                "name": "light_wood_hard",
+                "ring_margin": 0.06 * r0,   # let discs a bit closer to rings
+                "e_hit_min": 0.25,          # allow weaker edges
+                "sd_in_max": 0.22,          # allow more texture / highlights inside
+                "contrast_min": 0.01,       # OK with low contrast vs surroundings
+                "delta_board_min": 0.08,    # OK with being close to global board L
+                "mid_std_max": 1.0,   
+            }
         if 0.8 <= board_brightness <0.95 :
             return{
                 "name": "light_wood_hard",
