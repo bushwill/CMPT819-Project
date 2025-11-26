@@ -607,6 +607,7 @@ def _kmeans2_lab(feats, seed=0):
         L = np.argmin(D, axis=1)
         C_new = []
         for k in (0, 1):
+
             if np.any(L == k):
                 C_new.append(X[L == k].mean(axis=0))
             else:
@@ -657,6 +658,17 @@ def _select_disc_params(board_brightness, r0):
                 # allow slightly less perfect angular uniformity
                 "mid_std_max": 1.00,    # was 0.90
             }
+        if 0.8 <= board_brightness <0.95 :
+            return{
+                "name": "light_wood_hard",
+                "ring_margin": 0.32 * r0,   # let discs a bit closer to rings
+                "e_hit_min": 0.14,          # allow weaker edges
+                "sd_in_max": 0.22,          # allow more texture / highlights inside
+                "contrast_min": 0.001,       # OK with low contrast vs surroundings
+                "delta_board_min": 0.001,    # OK with being close to global board L
+                "mid_std_max": 1.3,   
+            }
+
         # Brighter mid-wood (like your new board: ~0.688)
         # → make thresholds more forgiving for pale / white discs.
         return {
