@@ -1,10 +1,9 @@
 image_name,success,pred_team1,pred_team2,gt_team1,gt_team2,abs_error_team1,abs_error_team2,error_pct_team1,error_pct_team2,num_discs,error_msg
 board.jpg,True,35.0,65.0,30,55,5.0,10.0,16.666666666666664,18.181818181818183,10,
-board2.jpg,True,35.0,105.0,30,35,5.0,70.0,16.666666666666664,200.0,20,
-board4.jpg,True,30.0,60.0,30,30,0.0,30.0,0.0,100.0,6,
-board5.jpg,True,130.0,45.0,30,40,100.0,5.0,333.33333333333337,12.5,28,
-board8.jpg,True,65.0,0.0,0,0,65.0,0.0,100.0,0.0,8,
-board9.jpg,True,15.0,30.0,30,30,15.0,0.0,50.0,0.0,6,
+board2.jpg,True,35.0,35.0,30,35,5.0,0.0,16.666666666666664,0.0,9,
+board3.jpg,True,55.0,50.0,55,50,0.0,0.0,0.0,0.0,15,
+board4.jpg,True,30.0,30.0,30,30,0.0,0.0,0.0,0.0,4,
+board5.jpg,True,85.0,45.0,30,40,55.0,5.0,183.33333333333331,12.5,20,
 ivan_board1.jpg,True,0.0,0.0,0,0,0.0,0.0,0.0,0.0,0,
 ivan_board2.jpg,True,15.0,10.0,25,20,10.0,10.0,40.0,50.0,2,
 ivan_board3.jpg,True,5.0,10.0,15,20,10.0,10.0,66.66666666666666,50.0,2,
@@ -15,13 +14,13 @@ ivan_board7.jpg,True,40.0,35.0,45,35,5.0,0.0,11.11111111111111,0.0,7,
 ivan_board8.jpg,True,50.0,40.0,50,55,0.0,15.0,0.0,27.27272727272727,9,
 ivan_board9.jpg,True,65.0,60.0,65,75,0.0,15.0,0.0,20.0,12,
 ivan_board10.jpg,True,50.0,55.0,60,75,10.0,20.0,16.666666666666664,26.666666666666668,8,
-sam_board1.jpg,True,25.0,15.0,0,0,25.0,15.0,100.0,100.0,6,
-sam_board2.jpg,True,5.0,10.0,15,25,10.0,15.0,66.66666666666666,60.0,4,
-sam_board3.jpg,False,,,25,35,,,,,0,Board detection failed
-sam_board4.jpg,False,,,5,15,,,,,0,Board detection failed
+sam_board1.jpg,True,25.0,10.0,25,10,0.0,0.0,0.0,0.0,4,
+sam_board2.jpg,True,5.0,5.0,5,15,0.0,10.0,0.0,66.66666666666666,2,
+sam_board3.jpg,False,,,30,25,,,,,0,Board detection failed
+sam_board4.jpg,False,,,25,15,,,,,0,Board detection failed
 sam_board5.jpg,True,10.0,10.0,10,10,0.0,0.0,0.0,0.0,4,
-sam_board6.jpg,False,,,35,55,,,,,0,Board detection failed
-sam_board7.jpg,False,,,10,30,,,,,0,Board detection failed
-sam_board8.jpg,True,20.0,5.0,5,15,15.0,10.0,300.0,66.66666666666666,3,
-sam_board9.jpg,True,10.0,10.0,15,15,5.0,5.0,33.33333333333333,33.33333333333333,2,
-sam_board10.jpg,True,5.0,0.0,10,20,5.0,20.0,50.0,100.0,1,
+sam_board6.jpg,False,,,30,30,,,,,0,Board detection failed
+sam_board7.jpg,False,,,15,15,,,,,0,Board detection failed
+sam_board8.jpg,True,15.0,5.0,20,10,5.0,5.0,25.0,50.0,2,
+sam_board9.jpg,True,10.0,10.0,10,10,0.0,0.0,0.0,0.0,2,
+sam_board10.jpg,True,0.0,0.0,0,0,0.0,0.0,0.0,0.0,0,
