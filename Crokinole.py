@@ -5,9 +5,10 @@ Core functions for board detection, disc detection, and scoring.
 
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage import color, feature, transform, draw, filters, measure, morphology, exposure
+from skimage import color, feature, transform, draw, filters, measure, morphology, exposure, segmentation
 from matplotlib import patches
 from dataclasses import dataclass
+
 
 def preprocess_image(img, target_size=None, max_dimension=1200):
     """Resize and normalize image to RGB uint8 format."""
@@ -692,17 +693,28 @@ def _select_disc_params(board_brightness, r0):
         }
 
     # --- PRESET 3: Dark board / odd lighting (your blue board) ----------
-    if board_brightness < 0.45:
+    if board_brightness < 0.40:
         # Dark cloth / shaded board.
         return {
             "name": "dark_or_shaded",
-            "ring_margin": 0.35 * r0,
-            "e_hit_min": 0.24,
-            "sd_in_max": 0.18,
-            "contrast_min": 0.06,
-            "delta_board_min": 0.05,
-            "mid_std_max": 0.95,
+            "ring_margin": 0.40 * r0,
+            "e_hit_min": 0.14,
+            "sd_in_max": 0.36,
+            "contrast_min": 0.01,
+            "delta_board_min": 0.01,
+            "mid_std_max": 1.70,
         }
+    if 0.40 <= board_brightness < 0.47:
+        return {
+            "name": "dark_soft",
+            "ring_margin": 0.30 * r0,  # keep same ring margin for now
+            # MAIN loosened thresholds:
+            "e_hit_min":    0.22,   # was 0.25 – accept slightly weaker edges
+            "sd_in_max":    0.23,   # was 0.17 – allow a bit more texture
+            "contrast_min": 0.07,   # was 0.10 – accept slightly lower contrast
+            "delta_board_min": 0.05, # was 0.07 – disc can be closer to board L
+            "mid_std_max":  1.05,   # was 0.90 – allow more angular variation
+    }
 
     # --- Fallback: if we somehow land between bands ----------------------
     return {
@@ -1208,12 +1220,6 @@ def _detect_discs_midwood_smart(straightened_img, board_result, config):
 
 
 
-
-
-
-
-
-
 def debug_show_discs(image, discs, board_result=None, title="Detected discs"):
     """
     Quick visualization of disc detections.
@@ -1268,9 +1274,6 @@ def debug_show_discs(image, discs, board_result=None, title="Detected discs"):
     ax.set_title(f"{title} (N={len(discs)})")
     ax.axis('off')
     plt.show()
-
-
-
 
 
 def extract_disc_colours(image, discs, patch_half=3):
@@ -1414,18 +1417,29 @@ def calculate_disc_scores(discs, mask, line_band, board_info):
         center_dist = np.hypot(x - cx, y - cy)
         fully_in_20 = (center_dist + r) < (r_center - 1.0)
 
+        # Start from majority ring
         base_score = maj
         if maj == 15 and fully_in_20:
             base_score = 20
 
+        # --- LINE TOUCH LOGIC: choose the lowest ring actually touched ------
         if lower_touch:
-            lower_map = {20: 15, 15: 10, 10: 5, 5: 0, 0: 0}
-            base_score = lower_map[base_score]
-            flags.append('line_touch')
+            # What ring values appear on the disc perimeter?
+            # (we only care about the standard scores)
+            touched_vals = sorted({v for v in vals if v in (0, 5, 10, 15, 20)})
+            if len(touched_vals) >= 2:
+                # If we’re really on a boundary (saw 2+ different zones),
+                # use the *lowest* of them.
+                base_score = touched_vals[0]
+            # If len == 1, we’re probably just grazing numerical noise:
+            # leave base_score as-is.
 
-        if (center_dist + r) > (r_ring5 + 1):
+        # --- OUTSIDE CHECK: only if the disc is COMPLETELY outside the 5-ring
+        outside_margin = 1.0  # pixels of tolerance
+        if (center_dist - r) >= (r_ring5 + outside_margin):
             base_score = 0
             flags.append('outside')
+
 
         agree = np.mean([v == maj for v in vals])
         conf = float(agree) if 'line_touch' not in flags else max(0.3, float(agree) * 0.8)
@@ -1575,8 +1589,9 @@ def run_complete_pipeline(img_path, config, team1_20s=0, team2_20s=0):
         if verbose:
             print("Creating scoring regions...")
         scoring_mask = create_scoring_regions(img.shape, board_result)
+        raw_boundaries = segmentation.find_boundaries(scoring_mask, mode="inner")
 
-        line_band = np.zeros_like(scoring_mask, dtype=bool)
+        line_band = morphology.dilation(raw_boundaries, morphology.disk(1))
         
         board_info = {
             "center": board_result["center"],
