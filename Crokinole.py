@@ -640,9 +640,9 @@ def _select_disc_params(board_brightness, r0):
         }
 
     # --- PRESET 2: Medium wood boards -----------------------------------
-    if 0.45 <= board_brightness < 0.95:
+    if 0.40 <= board_brightness < 0.95:
         # Slightly darker / higher contrast wood
-        if board_brightness < 0.65:
+        if 0.45 <= board_brightness < 0.65:
             return {
                 "name": "mid_wood",
                 "ring_margin": 0.30 * r0,
@@ -679,7 +679,25 @@ def _select_disc_params(board_brightness, r0):
                 "delta_board_min": 0.001,    # OK with being close to global board L
                 "mid_std_max": 1.3,   
             }
+        if 0.40 <= board_brightness <= 0.45:
+            return {
+                "name": "dark_soft",
+                # smaller band so we don’t auto-kill so many on-line discs
+                "ring_margin": 0.20 * r0,
 
+                # easier edge requirement → fewer missed black discs
+                "e_hit_min":    0.05,   # down from 0.22
+
+                # still allow some texture, but not huge blobs
+                "sd_in_max":    0.23,   # you can keep this or even 0.22
+
+                # tighten these slightly to fight ghosts
+                "contrast_min":    0.1,  # up from 0.07
+                "delta_board_min": 0.1,  # up from 0.05
+
+                # keep angular variation reasonable
+                "mid_std_max":  1.00,   # down from 1.05
+            }
         # Brighter mid-wood (like your new board: ~0.688)
         # → make thresholds more forgiving for pale / white discs.
         return {
@@ -697,26 +715,13 @@ def _select_disc_params(board_brightness, r0):
         # Dark cloth / shaded board.
         return {
             "name": "dark_or_shaded",
-            "ring_margin": 0.40 * r0,
+            "ring_margin": 0.10 * r0,
             "e_hit_min": 0.14,
             "sd_in_max": 0.36,
             "contrast_min": 0.01,
             "delta_board_min": 0.01,
             "mid_std_max": 1.70,
         }
-    if 0.40 <= board_brightness < 0.47:
-        return {
-            "name": "dark_soft",
-            "ring_margin": 0.30 * r0,  # keep same ring margin for now
-            # MAIN loosened thresholds:
-            "e_hit_min":    0.22,   # was 0.25 – accept slightly weaker edges
-            "sd_in_max":    0.23,   # was 0.17 – allow a bit more texture
-            "contrast_min": 0.07,   # was 0.10 – accept slightly lower contrast
-            "delta_board_min": 0.05, # was 0.07 – disc can be closer to board L
-            "mid_std_max":  1.05,   # was 0.90 – allow more angular variation
-    }
-
-    # --- Fallback: if we somehow land between bands ----------------------
     return {
         "name": "default",
         "ring_margin": 0.30 * r0,
@@ -771,7 +776,7 @@ def detect_discs(straightened_img, board_result, config):
     board_bright = _board_brightness(straightened_img, board_result, inset_px=8)
 
     # Mid-wood band where the Smart Ring algo worked well (your 0.518 board)
-    if 0.45 <= board_bright < 0.60:
+    if 0.46 <= board_bright < 0.60:
         print(f"[DD] board_brightness={board_bright:.3f} → Smart Ring (mid-wood) path")
         return _detect_discs_midwood_smart(straightened_img, board_result, config)
     else:
