@@ -1,0 +1,421 @@
+\documentclass{fancydoc}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{verbatim}
+
+\title{Automatic Crokinole Round Scoring from a Single Photo\\Project Report}
+\author{William Bushell \and Rudra Patel}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+An interpretable, classical computer vision pipeline was implemented to compute Crokinole round scores from a single photograph. The pipeline locates and validates a Crokinole board, detects discs, assigns per disc scores (0, 5, 10, 15, 20) with handling of discs touching ring boundaries, clusters discs by colour into two teams, and produces per image overlay visualizations and a results CSV for audit. This report documents algorithms, configuration and design choices, evaluation methodology, results on the provided image set, observed failure modes, and prioritized recommendations.
+\end{abstract}
+
+\section{Introduction and objectives}
+Given a single photograph of a finished Crokinole round, the system must determine each player's final score according to official rules. Requirements:
+\begin{enumerate}[noitemsep]
+  \item Validate that the image contains a Crokinole board and reject non board images.
+  \item Detect visible discs and determine each disc's scoring region (0, 5, 10, 15, 20).
+  \item Apply the rule that a disc touching a ring line receives the lower adjacent score.
+  \item Partition discs into two player groups (colour) and compute per player totals, accept manual counts of removed 20 point discs.
+  \item Produce overlay visualizations and a per image results CSV for audit and evaluation.
+\end{enumerate}
+
+Approach: a geometry and photometry driven pipeline (edge detection, Hough circle analysis, perimeter sampling, Lab clustering). The implementation is in \texttt{Crokinole.py} and is driven by Jupyter notebooks that produce overlays and a results CSV.
+
+\section{Data and experimental setup}
+The image set used for development and evaluation is stored in \texttt{images/} in the repository. Notebooks process the images and write overlays and a per image summary CSV to \texttt{results/testset\_results.csv}. Ground truth available in the repository is team level totals per image, per disc ground truth annotations are not available nor implemented.
+
+Reproducibility: environment is specified by \texttt{requirements.txt}. The notebook \texttt{testset\_script.ipynb} calls the pipeline entrypoint \texttt{run\_complete\_pipeline(img\_path, config, team1\_20s, team2\_20s)} for each image and writes outputs.
+
+\section{Pipeline overview}
+Stages (implemented in \texttt{Crokinole.py}):
+\begin{enumerate}[noitemsep]
+  \item Preprocessing (resizing, RGB conversion).
+  \item Edge detection (Canny).
+  \item Ring detection and board validation (adaptive Hough + ratio based verification).
+  \item Scoring region mask creation (per pixel values 0,5,10,15,20).
+  \item Disc detection (brightness adaptive Hough).
+  \item Colour clustering for team assignment (Lab mean patch, K=2).
+  \item Per disc scoring by perimeter sampling and application of the lower of touched values rule.
+  \item Aggregation of visible scores and addition of manual 20 counts to compute final totals.
+\end{enumerate}
+
+Configuration values are centralized in \texttt{config.py}. The most significant parameters used by the pipeline are given in the algorithm subsections below.
+
+\section{Ring detection: \texttt{detect\_board\_and\_rings}}
+\textbf{Inputs and outputs}
+\begin{itemize}[noitemsep]
+  \item \textbf{Input}: binary edge map (Canny) of the preprocessed image.
+  \item \textbf{Output}: \texttt{board\_result} containing per ring centres/radii and a refined board centre, or \texttt{None} if verification fails.
+\end{itemize}
+
+\textbf{Algorithm (summary)}
+\begin{enumerate}[noitemsep]
+  \item Compute Canny edges with thresholds:
+    \begin{verbatim}
+    canny_low_threshold = 0.1
+    canny_high_threshold = 0.2
+    edge_sigma = 2
+    \end{verbatim}
+  \item Build an adaptively sampled radii vector so that approximately two hundred radii cover the plausible ring size range for the image.
+  \item Run the circular Hough transform and extract peaks using \texttt{hough\_circle\_peaks}.
+\item Consider the largest peaks as candidate outer rings (\texttt{ring\_5}). For each candidate:
+  \begin{itemize}[noitemsep]
+    \item Compute expected inner ring radii from configured ratios, e.g.\\
+      \verb|ring_ratios = {ring_5:1.00, ring_10:0.66, ring_15:0.33, center:0.05}|
+    \item For each expected inner radius, search among detected circles for a match within tolerances:
+      \begin{verbatim}
+      radius_tol = max(5 px, 0.15 * expected_r)
+      center_tol = max(5 px, 0.03 * board_radius)
+      \end{verbatim}
+  \end{itemize}
+
+  \item If a coherent set of rings is found, compute a refined centre (average of ring centres) and return \texttt{board\_result}.
+\end{enumerate}
+
+\textbf{Design decisions and rationale}
+\begin{itemize}[noitemsep]
+  \item Adaptive radii sampling reduces Hough runtime while maintaining scale coverage.
+  \item Ratio based verification enforces global geometric consistency and reduces false positives from incidental circles.
+  \item Tolerances combine absolute floors (5 px) with relative fractions (15\% for radii, 3\% for centres) to handle both large and small images.
+  \item The function rejects images that fail verification to avoid unreliable downstream scoring.
+\end{itemize}
+
+\textbf{Complexity and failure modes}
+\begin{itemize}[noitemsep]
+  \item Hough complexity scales with image area times number of radii, adaptive sampling mitigates cost.
+  \item Failure modes: weak edges (glare/underexposure), oblique viewpoint (elliptical rings), and circular background clutter. Recommendations: add ellipse based rectification for oblique views and a negative image set to measure false accept rate.
+\end{itemize}
+
+\section{Disc detection: generic preset driven path (\texttt{\_detect\_discs\_generic})}
+\textbf{Purpose and outputs}
+\begin{itemize}[noitemsep]
+  \item \textbf{Input}: preprocessed RGB image and \texttt{board\_result}.
+  \item \textbf{Output}: list of detected discs, each record containing centre, radius, quality/confidence, and a Lab colour vector.
+\end{itemize}
+
+\textbf{High level strategy}
+\begin{enumerate}[noitemsep]
+  \item Estimate a nominal disc radius $r_0$ from the detected centre radius 
+  \item Compute board median brightness over the play area and select a detection preset via \texttt{\_select\_disc\_params}. Presets set thresholds: \texttt{e\_hit\_min}, \texttt{sd\_in\_max}, \texttt{contrast\_min}, \texttt{ring\_margin}, \texttt{mid\_std\_max}, etc.
+  \item Enhance luminance (unsharp mask + CLAHE) to emphasize rims.
+  \item Run Hough circle detection over a narrow radius band around $r_0$.
+  \item For each candidate compute local descriptors and apply preset gating rules to accept/reject.
+  \item Apply non maximum suppression and remove centre hole artifacts.
+  \item Extract Lab patch means for accepted detections for later clustering.
+\end{enumerate}
+
+\textbf{Preset selection (example ranges)}
+\begin{itemize}[noitemsep]
+  \item \textbf{bright\_white}:
+    \begin{verbatim}
+    ring_margin = 0.25 * r0
+    e_hit_min = 0.28
+    sd_in_max = 0.15
+    contrast_min = 0.18
+    mid_std_max = 0.80
+    \end{verbatim}
+  \item \textbf{mid\_wood} :
+    \begin{verbatim}
+    ring_margin ~ 0.3 * r0
+    e_hit_min ~ 0.10-0.25
+    sd_in_max ~ 0.22-0.25
+    contrast_min ~ 0.001-0.08
+    mid_std_max ~ 1.0-1.3
+    \end{verbatim}
+  \item \textbf{dark\_or\_shaded}:
+    \begin{verbatim}
+    ring_margin = 0.10 * r0
+    e_hit_min = 0.14
+    sd_in_max = 0.36
+    contrast_min = 0.01
+    mid_std_max = 1.7
+    \end{verbatim}
+\end{itemize}
+
+\textbf{Preprocessing}
+\begin{itemize}[noitemsep]
+  \item Unsharp mask (radius=2, amount=1.5) to enhance rims.
+  \item Convert to grayscale and apply CLAHE (clip\_limit=0.01).
+  \item Compute dual Canny edges (on luminance and inverted luminance) and combine.
+\end{itemize}
+
+\textbf{Candidate descriptors}
+For each Hough candidate:
+\begin{itemize}[noitemsep]
+  \item \texttt{\_edge\_ring}: mean edge strength sampled around circumference.
+  \item \texttt{\_inside\_stats}: mean/std inside candidate and mean in a thin outer ring (contrast).
+  \item \texttt{\_angular\_uniformity}: angular standard deviation at mid radius.
+  \item Geometric checks: inside play mask and not inside centre hole.
+\end{itemize}
+
+\textbf{Gating logic}
+A candidate is accepted only if it satisfies the preset's conjunction of criteria:
+\begin{itemize}[noitemsep]
+  \item edge strength $\ge$ \texttt{e\_hit\_min},
+  \item interior std $\le$ \texttt{sd\_in\_max},
+  \item contrast $\ge$ \texttt{contrast\_min},
+  \item angular uniformity $\le$ \texttt{mid\_std\_max},
+  \item and other preset dependent checks (delta from board median, not on forbidden ring margin unless strong evidence).
+\end{itemize}
+On ring candidates (centres near scoring ring radii within \texttt{ring\_margin}) are suppressed unless strong evidence exists.
+
+\textbf{Post processing}
+\begin{itemize}[noitemsep]
+  \item Non maximum suppression removes nearby duplicates (distance threshold approximately 0.9 times the larger radius).
+  \item Remove any centres inside the centre hole and extract Lab patch means for clustering.
+\end{itemize}
+
+\textbf{Failure modes and mitigations}
+\begin{itemize}[noitemsep]
+  \item Overlapping discs: Hough may miss/merge overlapping rims. Mitigation: NMS helps some duplicates, recommended future work is watershed or instance segmentation.
+  \item Ring edge ghosts: suppressed by onring logic and checks.
+  \item Low contrast discs: presets tuned by brightness help, additional illumination correction or learned detectors may be needed.
+\end{itemize}
+
+\section{Per disc scoring: \texttt{calculate\_disc\_scores}}
+\textbf{Procedure}
+\begin{enumerate}[noitemsep]
+  \item For each detected disc, sample $N=32$ points uniformly around the nominal disc perimeter.
+  \item Query the scoring region mask at each sample point.
+  \item Base score = mode of sampled mask values.
+  \item If multiple scoring values are present among samples or any sample lies inside a dilated boundary band, assign the minimum of touched valid scores (lower of touched values rule).
+  \item If disc centre distance + radius < centre\_radius - 1 px and base score is 15, upgrade to 20 (conservative fully in hole test).
+  \item Confidence = fraction of perimeter samples equal to the assigned score (reduced if line touch present).
+\end{enumerate}
+
+\textbf{Rationale}
+Perimeter sampling implements the official rule deterministically and provides auditable sample points on overlays. The conservative fully in hole test avoids false 20 awards.
+
+\section{Small annotated code snippets}
+Below are short, annotated snippets taken and condensed from \texttt{Crokinole.py}. These are included to make the algorithm descriptions concrete and to show the key implementation patterns used in the pipeline. Snippets are intentionally concise and annotated, they are not full functions but demonstrate the logic and important checks.
+
+\subsection{detect\_board\_and\_rings (condensed, annotated)}
+\begin{lstlisting}[language=Python,basicstyle=\small\ttfamily,frame=single]
+# edges: binary Canny edge map
+# config: contains ring_ratios and tolerances
+
+# 1) Build adaptive radii array (target ~200 radii) then Hough:
+hough_res = transform.hough_circle(edges, radii)
+accums, cx, cy, radii_detected = transform.hough_circle_peaks(hough_res, radii,
+                                                              total_num_peaks=120)
+
+# 2) Turn peaks into candidate list [(x,y,r,accum), ...] and pick large candidates
+ring5_candidates = [c for c in candidates if c.radius >= ring5_min]
+
+# 3) For each ring5 candidate, search for inner rings by expected ratios:
+for ring5 in ring5_candidates[:5]:
+    board_radius = int(ring5.radius / ring_ratios['ring_5'])
+    matches = {}
+    for name, ratio in [('ring_10',0.66), ('ring_15',0.33), ('center',0.05)]:
+        expected_r = board_radius * ratio
+        radius_tol = max(5, expected_r * 0.15)
+        center_tol = max(5, board_radius * 0.03)
+        best = find_best_circle(cand, exp_r, ring5.center, radius_tol, center_tol)
+        if best is None:
+            break
+        matches[name] = best
+    if all inner rings matched:
+        board_result = refine_board_center(ring5, matches)
+        return board_result
+# otherwise return None
+\end{lstlisting}
+
+Short explanation: the snippet shows Hough peak extraction, selection of outer ring candidates, and an inner ring search that uses combined radius and centre tolerances. If a coherent concentric set is found the board result is returned.
+
+\subsection{\_detect\_discs\_generic (condensed, annotated)}
+\begin{lstlisting}[language=Python,basicstyle=\small\ttfamily,frame=single]
+# board_result provides ring centres/radii
+r0, r_min, r_max = _expected_disc_radius(board_result, config)
+params = _select_disc_params(board_brightness, r0)
+
+# Preprocess to boost rims:
+sharp = filters.unsharp_mask(img_float, radius=2, amount=1.5)
+lum = exposure.equalize_adapthist(color.rgb2gray(sharp), clip_limit=0.01)
+
+# Dual Canny to catch dark on light and light on dark rims
+e1 = feature.canny(lum, sigma=1.5, low_threshold=low_t, high_threshold=high_t)
+e2 = feature.canny(1.0 - lum, sigma=1.5, low_threshold=low_t, high_threshold=high_t)
+edges = np.maximum(e1, e2)
+
+# Hough over tight radii band:
+hspaces = transform.hough_circle(edges, np.arange(r_min, r_max+1))
+acc, hcx, hcy, rs = transform.hough_circle_peaks(hspaces, np.arange(r_min, r_max+1),
+                                                 total_num_peaks=140)
+
+candidates = []
+for score, x, y, r in zip(acc, hcx, hcy, rs):
+    if not play_mask[int(y), int(x)]: continue
+    e_hit = _edge_ring(edges, x, y, r)
+    mu_in, sd_in, mu_out = _inside_stats(lum, x, y, r)
+    mid_std, mid_mean = _angular_uniformity(lum, x, y, r)
+    contrast = abs(mu_in - mu_out)
+    # gating according to preset:
+    if e_hit < params['e_hit_min'] or 
+    sd_in > params['sd_in_max'] or contrast < params['contrast_min']:
+        continue
+    candidates.append((x, y, r, e_hit))
+
+# Non max suppression and removal of centre hole artifacts:
+picked = nms_by_distance_and_score(candidates)
+# Extract Lab patches and return detections
+\end{lstlisting}
+
+Short explanation: this snippet shows the preprocessing, Hough candidate extraction, photometric descriptors, preset driven gating, and NMS that produce final disc detections.
+
+\subsection{calculate\_disc\_scores (condensed)}
+\begin{lstlisting}[language=Python,basicstyle=\small\ttfamily,frame=single]
+# For each detected disc (x,y,r), sample N points on perimeter
+N = 32
+angles = np.linspace(0, 2*np.pi, N, endpoint=False)
+samples = []
+for theta in angles:
+    sx = int(x + r * np.cos(theta))
+    sy = int(y + r * np.sin(theta))
+    samples.append(scoring_mask[sy, sx])
+# base score = mode(samples)
+base = mode(samples)
+# if multiple values touched or any sample in line_band -> assign min touched value
+touched = set(samples) - {0}
+if len(touched) > 1 or any(line_band[...]):
+    assigned = min(touched) if touched else 0
+else:
+    assigned = base
+# fully in hole upgrade:
+if (distance_to_center + r) < (center_radius - 1) and assigned == 15:
+    assigned = 20
+confidence = samples.count(assigned) / float(N)
+\end{lstlisting}
+
+Short explanation: perimeter sampling reads the rasterized scoring mask, enforces the lower of touched values rule, performs the conservative in hole upgrade to 20, and computes a per disc confidence.
+
+\section{Evaluation methodology}
+The notebook driven evaluation writes \texttt{results/testset\_results.csv} with columns:
+\begin{verbatim}
+image_name, success, pred_team1, pred_team2, gt_team1, gt_team2,
+abs_error_team1, abs_error_team2, error_pct_team1, error_pct_team2,
+num_discs, error_msg
+\end{verbatim}
+
+Reported metrics (team level):
+\begin{itemize}[noitemsep]
+  \item Exact match fraction for final totals.
+  \item Per image absolute team errors and percent errors.
+  \item Mean absolute final point error per image.
+  \item Correlation of error with number of detected discs.
+\end{itemize}
+
+Limitations: per disc ground truth is not available, per disc detection metrics cannot be computed from the current repository contents.
+
+\section{Results}
+Per image team level results (verbatim from \texttt{results/testset\_results.csv}):
+
+\begin{table}[H]
+\centering
+\caption{Per image summary (from \texttt{results/testset\_results.csv}).}
+\begin{tabular}{@{}lrrrrrrrrr@{}}
+\toprule
+Image & Pred T1 & Pred T2 & GT T1 & GT T2 & AbsErr T1 & AbsErr T2 & Err\% T1 & Err\% T2 & NumDiscs \\
+\midrule
+board1.jpg & 30 & 30 & 30 & 30 & 0 & 0 & 0.00 & 0.00 & 4 \\
+board2.jpg & 30 & 35 & 30 & 35 & 0 & 0 & 0.00 & 0.00 & 9 \\
+board3.jpg & 55 & 50 & 55 & 50 & 0 & 0 & 0.00 & 0.00 & 15 \\
+board4.jpg & 60 & 55 & 60 & 55 & 0 & 0 & 0.00 & 0.00 & 12 \\
+board5.jpg & 20 & 100 & 20 & 100 & 0 & 0 & 0.00 & 0.00 & 13 \\
+ivan\_board1.jpg & 0 & 0 & 0 & 0 & 0 & 0 & 0.00 & 0.00 & 0 \\
+ivan\_board2.jpg & 25 & 20 & 25 & 20 & 0 & 0 & 0.00 & 0.00 & 4 \\
+ivan\_board3.jpg & 60 & 75 & 60 & 75 & 0 & 0 & 0.00 & 0.00 & 11 \\
+ivan\_board4.jpg & 15 & 25 & 15 & 25 & 0 & 0 & 0.00 & 0.00 & 4 \\
+ivan\_board5.jpg & 35 & 30 & 35 & 35 & 0 & 5 & 0.00 & 14.29 & 6 \\
+ivan\_board6.jpg & 30 & 35 & 30 & 35 & 0 & 0 & 0.00 & 0.00 & 6 \\
+ivan\_board7.jpg & 50 & 35 & 45 & 30 & 5 & 5 & 11.11 & 16.67 & 8 \\
+ivan\_board8.jpg & 65 & 75 & 65 & 75 & 0 & 0 & 0.00 & 0.00 & 14 \\
+sam\_board1.jpg & 0 & 0 & 0 & 0 & 0 & 0 & 0.00 & 0.00 & 0 \\
+sam\_board2.jpg & 10 & 10 & 10 & 10 & 0 & 0 & 0.00 & 0.00 & 2 \\
+sam\_board3.jpg & 25 & 10 & 25 & 10 & 0 & 0 & 0.00 & 0.00 & 4 \\
+sam\_board4.jpg & 5 & 15 & 5 & 15 & 0 & 0 & 0.00 & 0.00 & 4 \\
+sam\_board5.jpg & 20 & 25 & 20 & 25 & 0 & 0 & 0.00 & 0.00 & 6 \\
+sam\_board6.jpg & 60 & 60 & 50 & 60 & 10 & 0 & 20.00 & 0.00 & 12 \\
+sam\_board7.jpg & 15 & 75 & 20 & 85 & 5 & 10 & 25.00 & 11.76 & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Aggregate statistics}
+\begin{itemize}[noitemsep]
+  \item Evaluated images: 20
+  \item Exact final team totals: 16 / 20 = 80\%
+  \item Images with any non zero final error: 4 / 20 = 20\%
+  \item Total absolute final point error: 40 points
+  \item Mean absolute final point error per image: 2.0 points
+  \item Mean detected discs per image: 7.2
+\end{itemize}
+
+\section{Representative overlays}
+\begin{figure}[H]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{good_overlay_example.png}
+    \caption*{Representative success: accurate detection and scoring (overlay).}
+  \end{minipage}
+  \hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{bad_overlay_example.png}
+    \caption*{Representative failure: ghost disc detection (false positives) and failure to detect discs (false negatives).}
+  \end{minipage}
+  \caption{Representative overlay outputs.}
+\end{figure}
+
+\section{Recommendations and future work}
+To improve robustness and address failure modes:
+\begin{enumerate}[noitemsep]
+  \item Perspective rectification (ellipse fitting + homography) to correct oblique views.
+  \item Overlap handling.
+  \item Collect per disc ground truth annotations for detection level evaluation.
+  \item Add an interactive review step in the notebooks to handle low confidence cases.
+\end{enumerate}
+
+\section{Conclusions}
+A deterministic, interpretable pipeline for Crokinole scoring has been implemented and evaluated. The pipeline attains exact team totals on the majority of evaluated images, remaining weaknesses are overlapping discs, near line sensitivity, and detection artifacts. The report documents algorithms, parameter choices, evaluation method and results, and provides prioritized recommendations.
+
+\section*{Acknowledgements}
+Thanks to our peers Ivan and Sam for dataset assistance, and Dr. Mark Eramian for feedback.
+
+\appendix
+\section{Appendix A: Individual contributions}
+\begin{itemize}[noitemsep]
+  \item William Bushell: ring pattern detection, board detection, scoring mask creation.
+  \item Rudra Patel: disc detection, disc automatic threshold, perimeter sampling scoring logic, and scoring calculation.
+  \item Both: dataset collection, parameter tuning, testing, pipeline development and report preparation.
+\end{itemize}
+
+\section{Appendix B: Brief user manual}
+\subsection*{Environment}
+\begin{verbatim}
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+\end{verbatim}
+
+\subsection*{Run evaluation}
+Open testset\_script.ipynb and run all cells. The notebook calls
+run\_complete\_pipeline for each image and writes overlay PNGs and a
+summary CSV to results/.
+
+\end{document}
